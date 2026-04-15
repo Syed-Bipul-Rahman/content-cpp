@@ -1,0 +1,96 @@
+---
+title: Hello, World — and what actually happens
+description: Your first C++ program, and a tour of every layer it touches.
+---
+
+# Hello, World — and what actually happens
+
+Most tutorials show you this:
+
+```cpp
+#include <iostream>
+
+int main() {
+    std::cout << "Hello, World!\n";
+    return 0;
+}
+```
+
+…and move on. We won't. Because if you don't understand what this tiny program
+actually *does*, nothing that comes later will stick.
+
+## Compile it
+
+Save the file as `hello.cpp`. Then:
+
+```bash
+g++ -std=c++20 -Wall -Wextra -o hello hello.cpp
+./hello
+```
+
+You should see `Hello, World!`. If you don't, your toolchain isn't installed —
+see the next lesson.
+
+## What each line means
+
+### `#include <iostream>`
+
+This is a **preprocessor directive**. Before your code reaches the compiler
+proper, a program called the *preprocessor* literally pastes the contents of
+`<iostream>` — a standard-library header that declares `std::cout` and friends —
+into your file. Think copy-paste.
+
+### `int main()`
+
+The **entry point**. Every C++ program starts here. When you run `./hello`, the
+operating system loader sets up the process, hands control to the C runtime,
+which calls `main()`. When `main()` returns, the process exits with that return
+value as its exit status. The shell stores it in `$?`.
+
+```bash
+./hello
+echo $?   # 0
+```
+
+### `std::cout << "Hello, World!\n";`
+
+`std::cout` is an object — specifically an `std::ostream` — that writes to
+standard output. The `<<` operator is **overloaded** on that type to mean
+"insert this into the stream." The string literal `"Hello, World!\n"` is a
+`const char[15]` living in read-only memory, baked into your binary.
+
+### `return 0;`
+
+By convention, `0` means success. Any non-zero value means failure. Shell
+scripts, CI systems, and other programs use this to decide what to do next.
+
+## The layers you just touched
+
+When you ran `./hello`, you triggered:
+
+1. The **kernel** allocated a virtual address space, mapped your binary into it,
+   and jumped to the entry point.
+2. The **C runtime** (`_start` in glibc, or its equivalent) set up argc/argv,
+   initialized global constructors, then called your `main`.
+3. Your code called into `libstdc++` (or `libc++` on macOS), which ultimately
+   issued a `write(2)` **syscall** to file descriptor 1.
+4. The kernel routed that write to your terminal device.
+
+You just crossed the boundary between user space and kernel space. This is the
+same boundary you'll cross when you write a web server, a shell, or an OS. Get
+comfortable with the picture.
+
+## Exercises
+
+1. Remove `return 0;`. Does it still compile? (In `main`, yes — this is a
+   special rule.) What's the exit code now?
+2. Write a program that returns `42`. Check `echo $?` confirms it.
+3. Replace `"\n"` with `std::endl`. Benchmark with `time` on a loop of a million
+   lines. Why is `"\n"` faster?
+4. Use `g++ -E hello.cpp` to see the preprocessed output. How many lines did
+   `#include <iostream>` add?
+
+## What's next
+
+Next up: setting up a real toolchain — compiler, linker, build system — the
+minimum environment every other lesson assumes you have.

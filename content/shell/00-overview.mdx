@@ -1,0 +1,61 @@
+---
+title: Build Your Own Shell — Overview
+description: A POSIX shell with fork, exec, pipes, redirection, and job control.
+---
+
+# Build Your Own Shell
+
+A shell is a program that reads commands and runs them. That's it. Every shell
+you've used — `bash`, `zsh`, `fish` — started as this exact problem.
+
+## What you'll build
+
+A shell called `msh` that:
+
+- Runs external commands: `ls`, `grep`, `cat`
+- Supports pipes: `ls | grep cpp | wc -l`
+- Handles redirection: `echo hi > file`, `sort < data.txt`
+- Has built-ins: `cd`, `exit`, `export`, `pwd`
+- Supports environment variable expansion: `echo $HOME`
+- Job control: `&`, `jobs`, `fg`, `bg`
+- A reasonable prompt and line editing via `readline`
+
+## The core idea
+
+Every shell, at its core, is a loop:
+
+```
+while (true) {
+    print prompt
+    read line
+    parse into commands
+    for each command: fork(), then exec() in the child
+    parent waits (or doesn't, for &)
+}
+```
+
+The magic is in three syscalls: `fork()`, `exec()`, and `wait()`. Once you
+understand those, the rest is parsing and plumbing.
+
+## Pipes: the trick
+
+A pipe is two file descriptors. One end is write, the other is read. `fork`,
+redirect the child's stdout to the write end, exec, then redirect the next
+child's stdin to the read end. Chain them. That's `ls | grep cpp`.
+
+```
+ls       → writes to pipe write end
+grep cpp → reads from pipe read end
+```
+
+## Prerequisites
+
+- [Pointers and memory](/learn/cpp-fundamentals/06-pointers-and-memory)
+- [Filesystem and I/O](/learn/cpp-fundamentals/18-filesystem-and-io)
+- Comfort with syscalls — `man 2 fork`, `man 2 execvp`, `man 2 pipe`
+
+## What you'll walk away with
+
+A working shell under 2000 lines. A visceral understanding of what happens when
+you press Enter in your terminal. A foundation for understanding init systems,
+process supervisors, and the OS track later.

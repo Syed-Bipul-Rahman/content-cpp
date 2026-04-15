@@ -1,0 +1,219 @@
+---
+title: Testing, sanitizers, profilers, debuggers
+description: The toolchain around your toolchain. The difference between shipping and guessing.
+---
+
+# Testing and tooling
+
+You've reached the end of the foundations. The last skill is the one beginners
+skip and professionals never drop: **knowing whether your code is actually
+correct and fast**.
+
+This lesson is less about C++ features and more about workflow. Every
+project track assumes these tools are available to you.
+
+## Testing — a framework
+
+Pick one and learn it:
+
+- **GoogleTest** — the most popular, feature-rich.
+- **Catch2** — header-only, minimal setup.
+- **doctest** — smaller still, fastest compile.
+
+A Catch2 example:
+
+```cpp
+#define CATCH_CONFIG_MAIN
+#include <catch2/catch.hpp>
+#include "my_parser.hpp"
+
+TEST_CASE("parser handles empty input") {
+    auto result = parse("");
+    REQUIRE(!result.has_value());
+}
+
+TEST_CASE("parser handles numbers") {
+    auto result = parse("42");
+    REQUIRE(result.has_value());
+    REQUIRE(result.value() == 42);
+}
+```
+
+CMake integration:
+
+```cmake
+find_package(Catch2 3 REQUIRED)
+add_executable(tests tests.cpp)
+target_link_libraries(tests PRIVATE Catch2::Catch2WithMain my_parser)
+```
+
+Run tests on every commit. CI catches what local runs miss.
+
+## Sanitizers — find bugs the compiler can't
+
+Build with these in debug. All ship with GCC/Clang.
+
+### AddressSanitizer
+
+```bash
+g++ -std=c++20 -g -O1 -fsanitize=address -fno-omit-frame-pointer app.cpp
+```
+
+Catches:
+
+- Use-after-free
+- Heap and stack buffer overflows
+- Double-free
+- Memory leaks
+
+Runtime cost ~2×. Worth it during development.
+
+### UndefinedBehaviorSanitizer
+
+```bash
+g++ -fsanitize=undefined app.cpp
+```
+
+Catches:
+
+- Signed integer overflow
+- Null pointer dereference
+- Misaligned loads
+- Bad enum values
+
+Always on in debug builds.
+
+### ThreadSanitizer
+
+```bash
+g++ -fsanitize=thread -g app.cpp
+```
+
+Catches data races. Slower (~10×), unmissable for any concurrent code.
+
+### MemorySanitizer (Clang only)
+
+Catches reads of uninitialized memory. Harder to use — requires
+instrumented dependencies.
+
+## Debuggers
+
+### GDB (Linux)
+
+```bash
+g++ -g -O0 app.cpp -o app
+gdb ./app
+(gdb) break main
+(gdb) run arg1 arg2
+(gdb) next       # step over
+(gdb) step       # step into
+(gdb) print x    # inspect
+(gdb) bt         # backtrace
+(gdb) cont
+```
+
+### LLDB (macOS, also Linux)
+
+Same ideas, slightly different commands (`b`, `r`, `n`, `s`, `p`, `bt`, `c`).
+
+### `printf` debugging
+
+Still valid. Often faster than firing up a debugger for a simple bug. Don't
+be proud about it.
+
+## Profilers
+
+When something is slow, **measure** before you guess.
+
+### `perf` (Linux)
+
+```bash
+g++ -O2 -g app.cpp -o app
+perf record ./app
+perf report
+```
+
+Shows hot functions and call paths. Sampling-based, low overhead.
+
+### Flame graphs
+
+```bash
+perf record -F 99 -g ./app
+perf script | stackcollapse-perf.pl | flamegraph.pl > flame.svg
+```
+
+A visual map of where time goes. Read Brendan Gregg's site.
+
+### `callgrind` / `kcachegrind`
+
+Simulated profiler (slower, more accurate for call counts).
+
+### `time`
+
+For the world's simplest profiler:
+
+```bash
+time ./app
+```
+
+Use before you reach for anything fancier.
+
+## Microbenchmarks — Google Benchmark
+
+```cpp
+#include <benchmark/benchmark.h>
+
+static void BM_Sort(benchmark::State& state) {
+    std::vector<int> v(state.range(0));
+    for (auto _ : state) {
+        std::iota(v.begin(), v.end(), 0);
+        std::ranges::shuffle(v, std::mt19937{42});
+        std::ranges::sort(v);
+    }
+}
+BENCHMARK(BM_Sort)->Range(1 << 10, 1 << 20);
+BENCHMARK_MAIN();
+```
+
+Run, read, ignore anything under a microsecond — it's probably noise.
+
+## Static analysis
+
+- **clang-tidy**: style and bug checks on every file.
+- **cppcheck**: second pair of eyes.
+- **-Wall -Wextra -Wpedantic**: the compiler is a linter. Use it.
+
+Add `-Werror` in CI. Warnings that fail the build are warnings that get fixed.
+
+## Format
+
+`clang-format` — a single tool, a `.clang-format` file at the repo root, and
+nobody argues about braces anymore.
+
+## Documentation
+
+- **Doxygen** for API docs.
+- A README for anyone who opens the repo.
+- A CHANGELOG for the humans who consume your releases.
+
+## A minimal project checklist
+
+Before considering a project track "done":
+
+- [ ] Builds clean with `-Wall -Wextra -Wpedantic -Werror`
+- [ ] Tests pass under AddressSanitizer and UBSan
+- [ ] Concurrent code tested under ThreadSanitizer
+- [ ] A benchmark or two for hot paths
+- [ ] A README showing how to build and use
+- [ ] No commented-out code, no TODO without a date or issue number
+
+## You are done with foundations
+
+The next decision is: **which project first?**
+
+- Want a quick win? → [Build Your Own CLI Tool](/projects/cli-tool)
+- Want the classic systems project? → [Build Your Own Shell](/projects/shell)
+- Want the network one? → [Build Your Own Web Server](/projects/webserver)
+- Want the hard one? → [Build Your Own OS](/projects/os)
+
+Pick one. Finish it. Then pick another.

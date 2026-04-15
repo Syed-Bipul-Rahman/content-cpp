@@ -1,0 +1,164 @@
+---
+title: Templates — generic programming from scratch
+description: How the STL is built, and how to build your own generic code.
+---
+
+# Templates
+
+A template is a **blueprint** that the compiler uses to generate code. You
+write it once; the compiler instantiates a version for each type you use it
+with. This is how `std::vector<int>`, `std::vector<std::string>`, and
+`std::vector<MyType>` all exist.
+
+## Function templates
+
+```cpp
+template <typename T>
+T max(T a, T b) {
+    return a > b ? a : b;
+}
+
+max(3, 5);           // T = int
+max(2.5, 1.7);       // T = double
+max<std::string>("a", "b");  // explicit
+```
+
+The compiler generates one version per concrete `T`. If `T` doesn't support
+`>`, compilation fails — but only when you actually use it.
+
+## Class templates
+
+```cpp
+template <typename T>
+class Stack {
+public:
+    void push(T v) { data.push_back(std::move(v)); }
+    T    pop()     { T v = std::move(data.back()); data.pop_back(); return v; }
+    bool empty() const { return data.empty(); }
+private:
+    std::vector<T> data;
+};
+
+Stack<int> s;
+s.push(1); s.push(2);
+```
+
+That's 90% of the STL — a class template that parameterizes a container on its
+element type.
+
+## Multiple parameters
+
+```cpp
+template <typename K, typename V>
+class Map {
+    // ...
+};
+
+Map<std::string, int> scores;
+```
+
+## Non-type template parameters
+
+Templates can take **values**, not just types:
+
+```cpp
+template <typename T, std::size_t N>
+class Array {
+    T data[N];
+public:
+    constexpr std::size_t size() const { return N; }
+    T& operator[](std::size_t i) { return data[i]; }
+};
+
+Array<int, 10> a;   // 10 is baked in at compile time
+```
+
+## Specialization
+
+You can provide a custom implementation for specific types:
+
+```cpp
+template <typename T>
+struct is_pointer { static constexpr bool value = false; };
+
+template <typename T>
+struct is_pointer<T*> { static constexpr bool value = true; };
+
+static_assert(is_pointer<int>::value == false);
+static_assert(is_pointer<int*>::value == true);
+```
+
+## Default template arguments
+
+```cpp
+template <typename T, typename Compare = std::less<T>>
+class SortedSet { /* ... */ };
+
+SortedSet<int> s;                           // uses std::less<int>
+SortedSet<int, std::greater<int>> rs;       // reversed
+```
+
+## Variadic templates
+
+A template that takes any number of parameters:
+
+```cpp
+template <typename... Args>
+void log(Args&&... args) {
+    (std::cout << ... << args) << '\n';     // C++17 fold expression
+}
+
+log("x=", 42, " y=", 3.14);
+```
+
+`Args...` is a **parameter pack**. Folds reduce it with an operator.
+
+## Concepts (C++20) — constraining templates
+
+Before C++20, bad arguments to templates produced enormous error messages.
+Concepts fix that:
+
+```cpp
+#include <concepts>
+
+template <std::integral T>
+T gcd(T a, T b) {
+    while (b) { T t = b; b = a % b; a = t; }
+    return a;
+}
+
+gcd(12, 18);        // OK
+gcd(1.5, 2.5);      // clear error: double is not integral
+```
+
+You can define your own:
+
+```cpp
+template <typename T>
+concept Hashable = requires(T t) {
+    { std::hash<T>{}(t) } -> std::convertible_to<std::size_t>;
+};
+```
+
+## Where templates live
+
+Templates are defined in **headers**, not `.cpp` files. The compiler needs to
+see the full definition to instantiate it wherever it's used. This is why STL
+headers are large.
+
+## The cost of templates
+
+- **Compile time**: each instantiation is recompiled. Heavy template code hurts
+  build times.
+- **Binary size**: one copy per type. Usually fine.
+- **Runtime**: zero overhead. Templates are not virtual calls.
+
+## Exercises
+
+1. Write a generic `print_all` function that takes any container and prints
+   its elements, separated by commas.
+2. Implement a `constexpr Array<T, N>` class matching the example above.
+3. Write a variadic `make_vector(args...)` that returns a `std::vector<T>`
+   deduced from the first argument.
+4. Use a concept to constrain `max` to types that are `std::totally_ordered`.
+5. Write your own `enable_if` and use it before concepts existed.

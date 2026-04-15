@@ -1,0 +1,172 @@
+---
+title: Control flow — if, loops, switch
+description: Making programs make decisions. The primitives and the idioms.
+---
+
+# Control flow
+
+A program that can't branch is a calculator. Control-flow statements are what
+make code *decide*, *repeat*, and *abort*. C++ inherits most of these from C
+and adds a few of its own.
+
+## `if` / `else`
+
+```cpp
+int x{5};
+if (x > 0) {
+    std::cout << "positive\n";
+} else if (x == 0) {
+    std::cout << "zero\n";
+} else {
+    std::cout << "negative\n";
+}
+```
+
+Always use braces, even for one-line bodies. This prevents the Apple `goto
+fail` class of bug.
+
+### `if` with initializer (C++17)
+
+```cpp
+if (auto it = map.find(key); it != map.end()) {
+    use(it->second);
+}
+// `it` is out of scope here — scoped to the if
+```
+
+Use this whenever the variable is only needed inside the branch.
+
+## `switch`
+
+```cpp
+switch (token.kind) {
+    case Kind::Number:   return parseNumber();
+    case Kind::String:   return parseString();
+    case Kind::Ident:    [[fallthrough]];
+    case Kind::Keyword:  return parseIdent();
+    default:             throw std::runtime_error("bad token");
+}
+```
+
+- `case` labels without `break` (or `return`) **fall through**. Use the
+  `[[fallthrough]]` attribute to mark it intentional — otherwise the compiler
+  and your reviewers will flag it.
+- `switch` works on integer-like types: `int`, `char`, `enum`. Not strings.
+- Prefer `switch` over a chain of `if`s when the values are a small fixed set —
+  compilers generate jump tables.
+
+## `while` and `do…while`
+
+```cpp
+int n{10};
+while (n > 0) {
+    std::cout << n-- << '\n';
+}
+
+int guess{};
+do {
+    std::cin >> guess;
+} while (guess != secret);
+```
+
+`do…while` runs the body at least once. Rare, but essential when the test
+depends on work done inside the loop.
+
+## `for` — the classic
+
+```cpp
+for (int i = 0; i < 10; ++i) {
+    std::cout << i << ' ';
+}
+```
+
+Three parts: **init**, **condition**, **step**. Any of them can be empty.
+`for (;;) { }` is an infinite loop.
+
+## Range-based `for` (C++11)
+
+```cpp
+std::vector<int> v{1, 2, 3, 4};
+for (int x : v)       std::cout << x;  // copy
+for (int& x : v)      x *= 2;          // modify in place
+for (const auto& x : v) std::cout << x; // cheap, read-only
+```
+
+Use it whenever you don't need the index. It works on any container that
+defines `begin()` and `end()` — your own types included.
+
+## `break` and `continue`
+
+```cpp
+for (int i = 0; i < 100; ++i) {
+    if (i == target) break;         // exit the loop
+    if (i % 2 != 0)  continue;      // skip the rest, go to next iteration
+    use(i);
+}
+```
+
+`break` leaves the nearest enclosing loop (or `switch`). `continue` jumps to
+the next iteration's condition check.
+
+## `return`
+
+```cpp
+int abs(int x) {
+    if (x < 0) return -x;
+    return x;
+}
+```
+
+`return` leaves the enclosing function. Prefer **early returns** for guard
+clauses — they flatten the code and eliminate nested `else`.
+
+## `goto` — yes, really
+
+```cpp
+for (int i = 0; i < N; ++i) {
+    for (int j = 0; j < M; ++j) {
+        if (found(i, j)) goto done;
+    }
+}
+done:
+    use(i, j);
+```
+
+C++ has `goto`. It's legitimate for breaking out of nested loops and for
+error-handling in resource cleanup (though RAII makes the latter rare). Do not
+use it to simulate loops.
+
+## The conditional operator
+
+```cpp
+int abs = x < 0 ? -x : x;
+```
+
+Handy for short, one-expression branches. Do not chain more than one level
+deep.
+
+## `constexpr if` (C++17)
+
+Compile-time branching for templates:
+
+```cpp
+template <typename T>
+void print(T x) {
+    if constexpr (std::is_integral_v<T>) {
+        std::cout << std::dec << x;
+    } else {
+        std::cout << x;
+    }
+}
+```
+
+The branch not taken is **not compiled** — so the branches can use operations
+that exist only on some types.
+
+## Exercises
+
+1. Write `fizzbuzz(int n)` using only `if`. Then with `switch`. Compare.
+2. Given a string, count vowels using a range-based `for`.
+3. Rewrite a deeply nested set of `if`s using early returns. Measure the
+   reduction in cognitive load.
+4. Implement `clamp(x, lo, hi)` in one line using the conditional operator.

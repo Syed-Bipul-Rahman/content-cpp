@@ -1,0 +1,122 @@
+---
+title: RAII, ownership, and why C++ is different
+description: The single most important idea in C++. Everything else flows from this.
+---
+
+# RAII, ownership, and why C++ is different
+
+**RAII** — Resource Acquisition Is Initialization — is the idea that
+**owning a resource is tied to the lifetime of an object**. When the object is
+created, it acquires the resource. When it's destroyed, it releases it. You
+never call `close()`, `free()`, `delete()`, `unlock()` yourself. The language
+does it, deterministically, at the closing `}`.
+
+This is why C++ exists.
+
+## The anti-pattern (C-style)
+
+```cpp
+FILE* f = fopen("data.txt", "r");
+if (!f) return;
+// ... do work ...
+fclose(f);   // easy to forget, easy to skip on early return
+```
+
+If the code in the middle throws an exception, or takes an early return, or
+has a bug that jumps to a different branch — `fclose` never runs. File
+descriptor leak. Multiply by a million requests and your server dies.
+
+## The RAII way
+
+```cpp
+#include <fstream>
+
+{
+    std::ifstream f{"data.txt"};  // constructor: fopen
+    if (!f) return;
+    // ... do work, freely throw, freely return ...
+}   // destructor: fclose. Guaranteed. Always.
+```
+
+The destructor runs on every path out of the scope — normal return, early
+return, exception, stack unwinding. There is no way to skip it.
+
+## Writing your own RAII type
+
+```cpp
+class File {
+public:
+    explicit File(const char* path) : fp(std::fopen(path, "r")) {
+        if (!fp) throw std::runtime_error("could not open");
+    }
+    ~File() { if (fp) std::fclose(fp); }
+
+    File(const File&)            = delete;  // non-copyable
+    File& operator=(const File&) = delete;
+
+    File(File&& other) noexcept : fp(other.fp) { other.fp = nullptr; }
+    File& operator=(File&& other) noexcept {
+        if (this != &other) {
+            if (fp) std::fclose(fp);
+            fp = other.fp;
+            other.fp = nullptr;
+        }
+        return *this;
+    }
+
+    std::FILE* handle() const { return fp; }
+
+private:
+    std::FILE* fp{nullptr};
+};
+```
+
+That's the pattern. Constructor acquires. Destructor releases. Copy is either
+deleted or carefully implemented. Move is cheap.
+
+## The Rule of Zero, Three, Five
+
+- **Rule of Zero**: if your class has no special resources, don't write any
+  special members. Let the compiler generate them.
+- **Rule of Three**: if you write one of (destructor, copy constructor, copy
+  assignment), you probably need all three.
+- **Rule of Five**: same, extended with move constructor and move assignment.
+
+Follow the Rule of Zero 90% of the time by *composing* RAII types (smart
+pointers, `std::vector`, `std::string`, `std::fstream`) instead of writing your
+own.
+
+## Ownership
+
+Ownership is "who is responsible for destroying this resource". Every resource
+must have exactly one owner at any time. Ownership can be **transferred**
+(via move) but not **shared in conflict**. When you design a class, the first
+question is: what does this own?
+
+Three flavors you'll see on this site:
+
+- **Unique ownership**: `std::unique_ptr<T>`. One owner. Move-only.
+- **Shared ownership**: `std::shared_ptr<T>`. Reference-counted.
+- **No ownership**: raw pointer or reference. Just looking.
+
+## Why this matters for the projects
+
+Every project on this site is a resource-management problem in disguise.
+
+- The **web server** owns sockets.
+- The **database** owns file handles and memory pages.
+- The **shell** owns child processes.
+- The **3D renderer** owns GPU buffers.
+- The **OS** owns literally everything.
+
+Get RAII right and these projects write themselves. Get it wrong and you'll
+chase leaks and crashes forever.
+
+## Exercises
+
+1. Write a `Timer` class that prints elapsed time in its destructor. Use it to
+   time a block of code just by putting `Timer t;` at the top.
+2. Write a `MutexGuard` that locks a mutex in its constructor and unlocks in
+   its destructor. You've just written `std::lock_guard`.
+3. Convert a C-style program that uses `malloc`/`free` to RAII. Compare line
+   counts and bug-surface-area.

@@ -1,0 +1,130 @@
+---
+title: Pointers, heap, and the lifetime model
+description: The most important lesson in the whole curriculum. Read it twice.
+---
+
+# Pointers, heap, and the lifetime model
+
+This is the lesson that separates people who *use* C++ from people who
+*understand* it. Do not skip. Do not skim.
+
+## What a pointer actually is
+
+A pointer is a variable whose value is a **memory address**.
+
+```cpp
+int x{42};
+int* p = &x;    // p holds the address of x
+std::cout << p   << '\n';   // prints an address, e.g. 0x7ffeeabc
+std::cout << *p  << '\n';   // prints 42 — dereference
+```
+
+`&x` means "address of x". `*p` means "the thing at address p". That's all. No
+magic.
+
+## Stack vs heap
+
+```cpp
+int a{10};                 // stack — auto-destroyed at end of scope
+int* b = new int{20};      // heap — lives until you say delete
+delete b;                  // else: leak
+```
+
+- **Stack**: automatic lifetime, cheap, bounded in size (usually ~8 MB).
+- **Heap**: manual lifetime, slower, effectively unbounded.
+
+You'll use both. The trick is knowing when.
+
+## Why pointers exist
+
+1. **Sharing** — two pieces of code pointing at the same data.
+2. **Polymorphism** — a `Base*` pointing at a `Derived` object.
+3. **Optional absence** — a pointer can be `nullptr`.
+4. **Runtime-sized data** — arrays whose size isn't known at compile time.
+5. **Breaking ownership cycles** — weak references.
+
+## The four operations
+
+```cpp
+int  x{42};
+int* p = &x;     // take address
+int  y = *p;     // dereference (read)
+*p = 99;         // dereference (write)
+p = nullptr;     // null — points at nothing
+```
+
+Dereferencing a null or dangling pointer is **undefined behavior** — the most
+feared two words in the language. Your program might crash, or worse, keep
+running with subtly wrong data.
+
+## Manual heap allocation (don't do this in real code)
+
+```cpp
+int* p = new int{5};
+delete p;         // paired, exactly once
+
+int* arr = new int[100];
+delete[] arr;     // use delete[] for arrays
+```
+
+Rules:
+
+1. Every `new` paired with exactly one `delete`.
+2. Every `new[]` paired with exactly one `delete[]`.
+3. After `delete`, the pointer is a **dangling pointer** — don't touch it.
+
+You will get these wrong. So does everyone. That's why we don't write raw
+`new`/`delete` in real C++ — we use smart pointers (lesson 10) and RAII
+(lesson 9).
+
+## Lifetime — the idea that unlocks C++
+
+Every object has a **lifetime**: the span from construction to destruction.
+Accessing an object outside its lifetime is UB. Always.
+
+```cpp
+int* dangling() {
+    int x{5};
+    return &x;        // BUG. x dies here. Pointer is invalid.
+}
+```
+
+Modern C++ is built around making lifetimes **obvious** and **automatic**. Once
+you internalize this, smart pointers, RAII, move semantics, and ownership all
+click into place.
+
+## References
+
+A reference is a pointer that can't be null and can't be reassigned. Dereferencing
+is implicit. It's syntactic sugar for "pointer that must point somewhere valid".
+
+```cpp
+int x{5};
+int& r = x;        // r is another name for x
+r = 99;            // x is now 99
+```
+
+Prefer references when you don't need the features of a pointer (null, rebinding).
+
+## Pointer arithmetic
+
+```cpp
+int arr[4]{10, 20, 30, 40};
+int* p = arr;       // points to arr[0]
+std::cout << *(p + 2);  // 30 — advances by sizeof(int) bytes
+```
+
+This is how arrays and pointers are linked. `arr[i]` is literally
+`*(arr + i)`. You'll use this for parsing, networking, anything where data is
+laid out in memory you received.
+
+## Exercises
+
+1. Write a function `swap(int* a, int* b)` that swaps two ints through pointers.
+2. Allocate an array of 10 ints on the heap, fill it with their squares, print
+   them, free the memory. Run under `valgrind` or `-fsanitize=address`.
+3. Deliberately leak memory. Confirm the leak detector finds it.
+4. Write a function that takes a `const char*` and counts characters — your own
+   `strlen`. Do not call the library.
+5. Explain in one paragraph, without looking: what is undefined behavior, and
+   why does C++ have so much of it?

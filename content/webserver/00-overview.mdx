@@ -1,0 +1,62 @@
+---
+title: Build Your Own Web Server — Overview
+description: What you'll build, why it matters, and the mental model to start with.
+---
+
+# Build Your Own Web Server
+
+By the end of this track you will have written an HTTP/1.1 server — in C++,
+from scratch, using only the POSIX socket API and the standard library. It
+will serve static files, route requests, handle concurrent connections, speak
+keep-alive, and survive real traffic.
+
+No `libcurl`. No `Boost.Beast`. No framework. You write the bytes.
+
+## What "web server" actually means
+
+Strip away the Rails and the Nginx and the Kubernetes. A web server is:
+
+1. A process that **listens** on a TCP port.
+2. **Accepts** incoming connections.
+3. **Reads** bytes that look like `GET /index.html HTTP/1.1\r\n...`.
+4. **Writes** bytes that look like `HTTP/1.1 200 OK\r\n...`.
+5. **Closes** (or reuses) the connection.
+
+That's the whole game. Every server in the world is doing this. We're going to
+do it too.
+
+## The minimum viable version
+
+```
+listen() → accept() → read request → parse → route → respond → close
+```
+
+Single request, single thread, blocking I/O. One hundred lines of C++. Works.
+
+## Then we extend
+
+- Keep-alive connections
+- Concurrent requests (thread pool, then `epoll`/`kqueue`)
+- Static file serving with correct MIME types
+- Routing to handlers
+- Request bodies, `POST`, form data
+- Logging, timeouts, error pages
+- Stress testing with `wrk`
+
+## Prerequisites
+
+You need to be comfortable with:
+
+- [C++ Fundamentals lessons 1–19](/learn/cpp-fundamentals) — especially
+  pointers, RAII, and the networking basics lesson.
+- The POSIX socket API: `socket`, `bind`, `listen`, `accept`, `read`, `write`,
+  `close`. If these names don't ring a bell, do lesson 19 first.
+
+## What you'll walk away with
+
+- A working HTTP server in ~1500 lines of C++.
+- A real understanding of what Nginx is doing under the hood.
+- Comfort with blocking I/O, concurrency models, and the TCP/HTTP stack.
+- A foundation for the Redis, BitTorrent, search engine, and bot tracks.
+
+Ready? Next lesson covers what you need to know before we write the first line.

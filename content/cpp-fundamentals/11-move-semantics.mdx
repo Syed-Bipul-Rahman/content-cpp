@@ -1,0 +1,149 @@
+---
+title: Move semantics and rvalue references
+description: Why modern C++ is fast — and how to stop copying things you shouldn't.
+---
+
+# Move semantics
+
+In C++98, returning a big object from a function *copied* it. Passing a string
+into a function *copied* it. The compiler did heroic work (return value
+optimization) to hide the cost, but it wasn't always enough.
+
+C++11 added **move semantics**: the ability to transfer ownership of resources
+from one object to another, cheaply, without copying. Every modern C++ idiom
+— `std::unique_ptr`, `push_back`, `std::string` return values — depends on it.
+
+## The model
+
+A `std::string` owns a heap buffer. Copying one means allocating a new buffer
+and copying every byte. But what if the source is about to be destroyed
+anyway? Then we can just **steal its pointer** and leave the source in a
+valid-but-empty state.
+
+```cpp
+std::string a = "a large string...";
+std::string b = std::move(a);   // b steals the buffer. a is now empty.
+```
+
+After the move, `a` is valid (you can destroy it or assign to it) but its
+*value* is unspecified. Don't read from a moved-from object without reassigning
+first.
+
+## Rvalues and lvalues
+
+An **lvalue** is something with a name and an address (`x`, `obj.field`).
+An **rvalue** is a temporary — `42`, `foo()`, `x + y`.
+
+Rvalues are destined to disappear. The compiler knows this and can bind them
+to special references:
+
+```cpp
+void f(std::string& s);        // lvalue reference — binds to named strings
+void f(const std::string& s);  // binds to anything (prefers rvalues second)
+void f(std::string&& s);       // rvalue reference — binds to temporaries
+```
+
+Now we can write move-optimized overloads.
+
+## Move constructor and move assignment
+
+```cpp
+class Buffer {
+public:
+    Buffer(std::size_t n) : data{new int[n]}, size{n} {}
+    ~Buffer() { delete[] data; }
+
+    Buffer(const Buffer& other)             // copy
+        : data{new int[other.size]}, size{other.size} {
+        std::copy_n(other.data, size, data);
+    }
+
+    Buffer(Buffer&& other) noexcept         // move
+        : data{other.data}, size{other.size} {
+        other.data = nullptr;
+        other.size = 0;
+    }
+
+    Buffer& operator=(Buffer&& other) noexcept {
+        if (this != &other) {
+            delete[] data;
+            data = other.data;
+            size = other.size;
+            other.data = nullptr;
+            other.size = 0;
+        }
+        return *this;
+    }
+
+private:
+    int* data;
+    std::size_t size;
+};
+```
+
+- Move operations should **never throw** — mark them `noexcept`. If you don't,
+  containers like `std::vector` will copy instead of moving on growth.
+- After a move, the source must be in a **destructible** state — here, `nullptr`
+  is safe to `delete[]`.
+
+## `std::move` — a cast, not a move
+
+`std::move(x)` doesn't move anything. It's a cast from lvalue to rvalue
+reference, signaling "you may move from this". The actual move happens inside
+the move constructor or move assignment.
+
+```cpp
+std::string a = "hi";
+std::string b = std::move(a);   // move constructor runs because of the cast
+```
+
+## Return by value is free
+
+```cpp
+std::string make_greeting(const std::string& name) {
+    return "hello, " + name;
+}
+
+std::string g = make_greeting("world");
+```
+
+The compiler elides the copy via RVO. If elision fails, it moves. Either way,
+it's cheap. **Never** return `std::move(x)` — it can defeat RVO.
+
+## Passing for ownership
+
+```cpp
+class Store {
+public:
+    void add(std::string key) {        // take by value
+        keys.push_back(std::move(key));
+    }
+private:
+    std::vector<std::string> keys;
+};
+
+store.add("hello");              // moves a temporary in
+std::string k = "hi";
+store.add(std::move(k));         // explicit move
+store.add(k);                    // copies — you still own k
+```
+
+Take by value + move when you're going to store the argument. This handles all
+three cases (temporary, movable, copied) correctly.
+
+## Forwarding references (preview)
+
+`T&&` on a template is something else — a **forwarding reference** — covered
+later in the templates lesson. Don't confuse it with a move-only rvalue
+reference.
+
+## Exercises
+
+1. Add a copy and move constructor to the `File` RAII class from lesson 9.
+   Confirm move is cheap, copy is deleted or deep.
+2. Write a function that takes a `std::vector<std::string>` by value and
+   returns a shuffled version. Inspect the assembly with `-O2` — no copies.
+3. Build a move-only `Handle` that wraps a file descriptor with a custom
+   `noexcept` move and a deleted copy.
+4. Benchmark `push_back("literal")` vs `push_back(std::string("literal"))` on
+   a `vector<string>`. Why do they differ?

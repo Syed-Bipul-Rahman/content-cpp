@@ -1,0 +1,177 @@
+---
+title: Sockets, TCP, UDP — the raw API
+description: The foundation under every web server, bot, and database we'll build.
+---
+
+# Networking basics
+
+The C++ standard library has no built-in networking. You use the POSIX
+**sockets** API (or Winsock on Windows). Every networked C++ program uses it
+eventually. Most of the project tracks on this site build on top.
+
+## What a socket is
+
+A **socket** is a file descriptor that represents one endpoint of a
+communication channel. The OS treats it like a file — you `read()` and
+`write()` bytes to it — but under the hood it's talking to another socket
+across the network.
+
+## The TCP server loop
+
+```cpp
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <cstring>
+#include <iostream>
+
+int main() {
+    int srv = socket(AF_INET, SOCK_STREAM, 0);      // 1. create
+    int on = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(8080);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));  // 2. bind
+    listen(srv, 16);                                              // 3. listen
+
+    while (true) {
+        int client = accept(srv, nullptr, nullptr);               // 4. accept
+        char buf[1024];
+        ssize_t n = read(client, buf, sizeof(buf));               // 5. read
+        const char* reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        write(client, reply, std::strlen(reply));                 // 6. write
+        close(client);                                            // 7. close
+    }
+}
+```
+
+That's a web server. Everything else — parsing, routing, concurrency — is
+built on top of this loop.
+
+Compile:
+
+```bash
+g++ -std=c++20 -Wall server.cpp -o server
+./server
+# in another terminal:
+curl http://localhost:8080
+```
+
+## Byte order
+
+Network protocols use **big-endian** ("network byte order"). Your x86 machine
+is little-endian. The conversion helpers:
+
+- `htons` / `ntohs` — host ↔ network, short (16-bit)
+- `htonl` / `ntohl` — long (32-bit)
+
+Use them on every integer that goes over the wire.
+
+## The TCP client
+
+```cpp
+int s = socket(AF_INET, SOCK_STREAM, 0);
+
+sockaddr_in addr{};
+addr.sin_family = AF_INET;
+addr.sin_port   = htons(8080);
+inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+
+connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+const char* req = "GET / HTTP/1.0\r\n\r\n";
+write(s, req, std::strlen(req));
+
+char buf[4096];
+ssize_t n = read(s, buf, sizeof(buf));
+std::cout.write(buf, n);
+
+close(s);
+```
+
+## UDP
+
+UDP is connectionless. You send datagrams; they may or may not arrive. There's
+no `accept`.
+
+```cpp
+int s = socket(AF_INET, SOCK_DGRAM, 0);
+bind(s, ...);
+char buf[1500];
+sockaddr_in peer; socklen_t plen = sizeof(peer);
+ssize_t n = recvfrom(s, buf, sizeof(buf), 0,
+                     reinterpret_cast<sockaddr*>(&peer), &plen);
+sendto(s, buf, n, 0, reinterpret_cast<sockaddr*>(&peer), plen);
+```
+
+Use UDP for: DNS, games, video, situations where you can tolerate loss and
+don't want connection overhead.
+
+## Short reads and short writes
+
+`read` and `write` **can return fewer bytes than you asked for**. You must
+loop:
+
+```cpp
+ssize_t send_all(int fd, const char* buf, size_t n) {
+    size_t sent = 0;
+    while (sent < n) {
+        ssize_t r = write(fd, buf + sent, n - sent);
+        if (r <= 0) return -1;
+        sent += r;
+    }
+    return sent;
+}
+```
+
+Same for `read` when you know the target length. This catches everybody once.
+
+## Blocking vs non-blocking
+
+By default, `accept`, `read`, `write`, `connect` **block** — they suspend the
+thread until progress is possible. For servers handling many clients, you
+have three approaches:
+
+1. **Thread per connection.** Simple, scales to thousands, not millions.
+2. **Thread pool + blocking I/O.** Good for CPU-bound handlers.
+3. **Event loop with non-blocking I/O.** `epoll` on Linux, `kqueue` on BSD
+   and macOS, IOCP on Windows. Scales to C10K. This is what `nginx` does, and
+   what you'll build in the webserver track.
+
+Non-blocking mode:
+
+```cpp
+#include <fcntl.h>
+fcntl(fd, F_SETFL, O_NONBLOCK);
+```
+
+## TLS — we skip for now
+
+Real servers use HTTPS. TLS adds a lot of complexity, which we'll layer on
+once the plain-text pipeline works. In project tracks we'll use OpenSSL for
+the one or two places TLS is required (Telegram webhooks, Twitter API).
+
+## Error handling
+
+Every syscall can fail. Check the return value. On failure, read `errno`:
+
+```cpp
+int s = socket(AF_INET, SOCK_STREAM, 0);
+if (s < 0) {
+    std::perror("socket");   // prints "socket: Permission denied" etc.
+    return 1;
+}
+```
+
+## Exercises
+
+1. Echo server: read from a client, write the same bytes back, close. Test
+   with `telnet` or `nc`.
+2. Chat server: accept multiple clients (one thread each), broadcast any
+   message received to all connected clients.
+3. UDP ping: client sends a packet with a timestamp; server echoes; client
+   prints the round-trip time.
+4. Implement `send_all` and `recv_exactly`.
+5. Read `man 2 socket`, `man 2 bind`, `man 7 tcp`. Yes, really.

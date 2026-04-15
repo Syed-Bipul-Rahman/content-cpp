@@ -1,0 +1,158 @@
+---
+title: Exceptions, std::expected, and error design
+description: How to communicate that something went wrong — and the tradeoffs of each way.
+---
+
+# Error handling
+
+Errors are not exceptional. Network requests fail. Files don't exist. Users
+type junk. Deciding **how** to report errors is as important as the rest of
+your design.
+
+C++ gives you three options: **exceptions**, **return codes**, and
+**`std::expected`** (C++23). Each has its place.
+
+## Exceptions
+
+```cpp
+double divide(double a, double b) {
+    if (b == 0) throw std::invalid_argument{"divide by zero"};
+    return a / b;
+}
+
+try {
+    double r = divide(1, 0);
+} catch (const std::exception& e) {
+    std::cerr << e.what() << '\n';
+}
+```
+
+Pros:
+
+- Can't be ignored (unlike return codes).
+- Unwind the stack cleanly — RAII destructors fire.
+- Error-free paths have zero overhead on modern ABIs.
+
+Cons:
+
+- Costly when thrown. Not suitable for inner-loop error cases.
+- Banned in many codebases (game engines, embedded, parts of Chromium).
+- Can surprise readers if control flow isn't obvious.
+
+Use for: constructor failures, genuinely exceptional conditions, errors you
+expect to propagate far up the stack.
+
+## The `std::exception` hierarchy
+
+```cpp
+std::exception
+├── std::logic_error
+│   ├── std::invalid_argument
+│   ├── std::domain_error
+│   ├── std::length_error
+│   └── std::out_of_range
+└── std::runtime_error
+    ├── std::range_error
+    ├── std::overflow_error
+    └── std::system_error
+```
+
+Derive your own from `std::runtime_error` or `std::logic_error`:
+
+```cpp
+class ParseError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;   // inherit constructors
+};
+```
+
+## `noexcept`
+
+Declare functions that promise not to throw:
+
+```cpp
+void swap_handles(Handle& a, Handle& b) noexcept;
+```
+
+- Move operations **should** be `noexcept` (so `vector` can move on reallocation).
+- Destructors are implicitly `noexcept`.
+- If a `noexcept` function does throw, the program terminates.
+
+## Return codes
+
+C-style:
+
+```cpp
+int parse(const char* s, int* out);   // return 0 on success, nonzero on error
+```
+
+Cheap. Ubiquitous in OS APIs. But easy to ignore and hard to enrich.
+
+## `std::optional<T>` — "maybe a value"
+
+```cpp
+std::optional<int> parse(std::string_view s);
+
+if (auto n = parse("42")) {
+    use(*n);
+}
+```
+
+Use when absence isn't really an error — just a valid "nothing here".
+
+## `std::expected<T, E>` (C++23) — the modern answer
+
+```cpp
+#include <expected>
+
+enum class ParseError { Invalid, Overflow };
+
+std::expected<int, ParseError> parse(std::string_view s) {
+    if (s.empty()) return std::unexpected(ParseError::Invalid);
+    // ...
+    return 42;
+}
+
+auto r = parse("42");
+if (r) use(*r);
+else   handle(r.error());
+```
+
+Benefits of expected:
+
+- Error type is explicit in the signature.
+- No hidden control flow.
+- No heap allocation.
+- Composes with `.and_then()`, `.transform()`.
+
+If your compiler doesn't have C++23 yet, `tl::expected` is a drop-in polyfill.
+
+## Choosing
+
+| Situation | Use |
+| --- | --- |
+| Normal, expected failure (parse, find, open) | `expected` or `optional` |
+| Constructor cannot produce a valid object | exception |
+| Deep, multi-layer propagation | exception |
+| Performance-critical hot path | return code or `expected` |
+| Absence is not an error | `optional` |
+
+## Error-handling rules of thumb
+
+1. **Prefer `expected` or `optional` for expected failures.** Exceptions for
+   the unexpected.
+2. **Never silently swallow errors.** Ignoring an error is the decision; make
+   it explicit.
+3. **Log at the boundary, handle at the boundary.** Middle layers propagate.
+4. **Destructors do not throw.** Ever.
+5. **RAII guarantees cleanup.** You don't need `try/finally`.
+
+## Exercises
+
+1. Write `to_int(std::string_view s) -> std::expected<int, std::string>`.
+2. Write the same with exceptions. Compare readability and the overhead
+   when called a million times.
+3. Write a function that reads a config file and returns
+   `expected<Config, Error>` with an enum of possible failures.
+4. Derive your own exception type and use `throw_with_nested` to wrap an
+   inner error with a higher-level message.

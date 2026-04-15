@@ -1,0 +1,177 @@
+---
+title: STL containers — vector, map, unordered_map, set
+description: The data structures you reach for every day. Complexity, trade-offs, idioms.
+---
+
+# STL containers
+
+The C++ standard library ships a set of battle-tested containers. Learn these
+well and you'll rarely write your own.
+
+All live in `<vector>`, `<map>`, `<unordered_map>`, `<set>`, `<deque>`,
+`<list>`, `<array>`, `<forward_list>`, `<stack>`, `<queue>`,
+`<priority_queue>`.
+
+## `std::vector<T>` — the workhorse
+
+```cpp
+#include <vector>
+
+std::vector<int> v{1, 2, 3};
+v.push_back(4);          // O(1) amortized
+v.size();                // 4
+v[0];                    // unchecked
+v.at(0);                 // bounds-checked
+v.front(); v.back();
+v.pop_back();
+v.clear();
+v.reserve(1000);         // allocate up front if you know the size
+```
+
+- Contiguous memory — cache-friendly, fast iteration.
+- Dynamic — grows with geometric reallocation.
+- Invalidates pointers/iterators on reallocation.
+
+**Use it by default.** The overhead of cache locality usually beats clever
+data structures for small-to-medium collections.
+
+## `std::array<T, N>` — fixed size
+
+Covered in lesson 7. Use when size is a compile-time constant.
+
+## `std::deque<T>` — double-ended
+
+```cpp
+std::deque<int> d;
+d.push_front(1);   // O(1)
+d.push_back(2);    // O(1)
+```
+
+Not contiguous (implemented as chunks). Use when you need cheap push_front.
+
+## `std::list<T>` and `std::forward_list<T>` — doubly/singly linked
+
+Almost never the right answer. Terrible cache behavior. Use only when you
+need O(1) splice or stable iterators across arbitrary insertion.
+
+## `std::map<K, V>` — ordered associative
+
+```cpp
+#include <map>
+
+std::map<std::string, int> ages;
+ages["alice"] = 30;
+ages["bob"]   = 25;
+
+for (const auto& [name, age] : ages) {
+    std::cout << name << ": " << age << '\n';
+}
+// prints in sorted key order: alice, bob
+```
+
+- Red-black tree under the hood.
+- O(log n) insert/lookup/erase.
+- Keys in sorted order.
+- Iterators stable across insertions (not erases).
+
+## `std::unordered_map<K, V>` — hash-based
+
+```cpp
+#include <unordered_map>
+
+std::unordered_map<std::string, int> counts;
+counts["word"]++;
+
+auto it = counts.find("word");
+if (it != counts.end()) use(it->second);
+```
+
+- Hash table.
+- O(1) average, O(n) worst-case lookup.
+- **Faster than `std::map`** for most uses.
+- No ordering guarantees.
+
+Use `unordered_map` unless you need sorted iteration.
+
+## `std::set<T>` and `std::unordered_set<T>`
+
+Like their map cousins but without values — just keys. For membership tests
+and deduplication.
+
+## `std::stack` and `std::queue`
+
+Adapters — they wrap another container (default `deque`) with a LIFO or FIFO
+interface.
+
+```cpp
+std::stack<int> s;
+s.push(1); s.top(); s.pop();
+
+std::queue<int> q;
+q.push(1); q.front(); q.pop();
+```
+
+## `std::priority_queue<T>`
+
+A max-heap.
+
+```cpp
+std::priority_queue<int> pq;
+pq.push(3); pq.push(1); pq.push(2);
+pq.top();    // 3
+pq.pop();
+```
+
+For a min-heap:
+
+```cpp
+std::priority_queue<int, std::vector<int>, std::greater<>> pq;
+```
+
+## Choosing a container
+
+| Need | Use |
+| --- | --- |
+| Default | `vector` |
+| Fixed size | `array` |
+| Cheap push_front and push_back | `deque` |
+| Ordered keys | `map` / `set` |
+| Fast lookup, no order | `unordered_map` / `unordered_set` |
+| LIFO | `stack` |
+| FIFO | `queue` |
+| Top-K | `priority_queue` |
+
+## Iterators — the glue
+
+Every container provides `begin()` and `end()`. Range-based `for` and STL
+algorithms use them:
+
+```cpp
+for (auto it = v.begin(); it != v.end(); ++it) {
+    std::cout << *it;
+}
+```
+
+We'll lean on iterators hard in the next lesson.
+
+## Invalidation — the subtle trap
+
+Mutating a container can invalidate iterators, pointers, and references to
+its elements:
+
+- `vector::push_back` may reallocate → all iterators invalid.
+- `vector::erase` invalidates iterators at and after the erased element.
+- `unordered_map::insert` invalidates iterators (but not pointers to values)
+  on rehash.
+- `map::insert` and `map::erase` are friendlier — other iterators survive.
+
+Read the reference for any container you mutate while iterating.
+
+## Exercises
+
+1. Count word frequency from stdin with `unordered_map<std::string, int>`.
+   Print the top 10.
+2. Implement set intersection with two sorted `vector`s and `std::set_intersection`.
+3. Write a bounded LRU cache using `list` + `unordered_map`.
+4. Benchmark `std::map` vs `std::unordered_map` for 1M string lookups.
+5. Use `priority_queue` to implement Dijkstra's algorithm on a small graph.

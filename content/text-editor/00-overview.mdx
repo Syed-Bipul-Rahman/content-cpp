@@ -1,0 +1,33 @@
+---
+title: Build Your Own Text Editor — Overview
+description: A modal terminal editor in the kilo tradition — with undo, syntax, search.
+---
+
+# Build Your Own Text Editor
+
+A modal terminal editor in the kilo tradition — with undo, syntax, search.
+
+## What you'll build
+
+- Raw terminal mode — read keystrokes directly
+- Render a buffer with scrolling and cursor
+- Insert, delete, split lines, join lines
+- Incremental search with highlight
+- Syntax highlighting (state-machine based)
+- Undo/redo via an operation log
+- Save and load files
+
+## The core idea
+
+Everything you think of as 'editor' is a few hundred lines of terminal I/O plus a buffer data structure. The legend is Antirez's kilo — 1000 lines total. You can do this.
+
+## Prerequisites
+
+- Pointers and memory
+- Terminal basics (raw mode, escape sequences)
+
+## Where this sits in the curriculum
+
+This track is part of [learncpp.dev's 25+ project sequence](/projects). Do the
+[C++ Fundamentals](/learn/cpp-fundamentals) first. The next lessons in this
+track walk you through the build step by step.

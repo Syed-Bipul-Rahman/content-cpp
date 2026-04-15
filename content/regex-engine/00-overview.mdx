@@ -1,0 +1,32 @@
+---
+title: Build Your Own Regex Engine — Overview
+description: Parse regex, compile to an NFA, run it against input.
+---
+
+# Build Your Own Regex Engine
+
+Parse regex, compile to an NFA, run it against input.
+
+## What you'll build
+
+- Tokenize and parse regex syntax into an AST
+- Build an NFA using Thompson's construction
+- Simulate the NFA against input
+- Convert NFA → DFA for speed
+- Support `.`, `*`, `+`, `?`, `|`, `()`, `[]`, and anchors
+
+## The core idea
+
+A regex engine is a **compiler** in miniature. You're translating a pattern language into a state machine and running it. This is the track that demystifies compilers for a lot of people.
+
+## Prerequisites
+
+- Data structures (graphs, maps)
+- Templates and STL
+- Recursion
+
+## Where this sits in the curriculum
+
+This track is part of [learncpp.dev's 25+ project sequence](/projects). Do the
+[C++ Fundamentals](/learn/cpp-fundamentals) first. The next lessons in this
+track walk you through the build step by step.

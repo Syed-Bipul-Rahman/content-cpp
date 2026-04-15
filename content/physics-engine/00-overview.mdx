@@ -1,0 +1,31 @@
+---
+title: Build Your Own Physics Engine — Overview
+description: Rigid body dynamics, collision detection, constraint solving.
+---
+
+# Build Your Own Physics Engine
+
+Rigid body dynamics, collision detection, constraint solving.
+
+## What you'll build
+
+- Integrate Newton's equations (semi-implicit Euler, then Verlet)
+- Detect collisions: sphere-sphere, AABB, then SAT for convex polygons
+- Resolve collisions with impulses
+- Add friction and restitution
+- Implement a sequential-impulse constraint solver for joints
+
+## The core idea
+
+A physics engine is: update positions, detect overlaps, apply corrective impulses. The art is doing it stably and fast.
+
+## Prerequisites
+
+- Linear algebra
+- Floating-point gotchas
+
+## Where this sits in the curriculum
+
+This track is part of [learncpp.dev's 25+ project sequence](/projects). Do the
+[C++ Fundamentals](/learn/cpp-fundamentals) first. The next lessons in this
+track walk you through the build step by step.

@@ -1,0 +1,141 @@
+---
+title: Functions, references, overloading
+description: The unit of reuse in C++. Pass-by-what, overload resolution, defaults.
+---
+
+# Functions
+
+Functions are named reusable blocks of code that accept inputs (parameters)
+and return a result. The C++ story is richer than most languages because of
+**references**, **overloading**, and **templates**.
+
+## Signature
+
+```cpp
+int add(int a, int b) {
+    return a + b;
+}
+```
+
+- Return type first.
+- Name.
+- Parameter list.
+- Body.
+
+## Pass-by-value vs pass-by-reference
+
+```cpp
+void byValue(std::string s)       { s += "!"; }          // copies
+void byRef(std::string& s)        { s += "!"; }          // mutates caller's
+void byConstRef(const std::string& s) { print(s); }      // cheap read-only
+```
+
+Rules:
+
+- **Small, trivially-copyable types** (`int`, `double`, pointers): pass by
+  value.
+- **Large types** you'll read but not modify: pass by `const T&`.
+- **Types you need to modify in place**: pass by `T&`.
+- **Types you're taking ownership of**: pass by value, move on the way in.
+
+## Return
+
+```cpp
+std::string greet(std::string name) {
+    return "hello, " + std::move(name);
+}
+```
+
+Return by value. The compiler elides the copy (NRVO/RVO) or moves — it's free.
+Do **not** return references to local variables.
+
+## Default arguments
+
+```cpp
+void log(const std::string& msg, int level = 0);
+log("started");        // level defaults to 0
+log("warning", 1);
+```
+
+Defaults live on the **declaration**, not the definition. They're
+evaluated at the call site.
+
+## Overloading
+
+Multiple functions can share a name if they differ in parameter types:
+
+```cpp
+int  area(int side)             { return side * side; }
+int  area(int w, int h)         { return w * h; }
+double area(double r)           { return 3.14159 * r * r; }
+```
+
+The compiler picks the best match at each call. Return type **alone** does
+not distinguish overloads.
+
+## Overload resolution, briefly
+
+When you call `f(x)`, the compiler:
+
+1. Finds all candidates with that name.
+2. Filters to ones where the arguments can convert.
+3. Ranks the matches — exact > promotion > standard conversion > user-defined.
+4. Picks the best, or errors if ambiguous.
+
+You'll rarely need the full rules, but knowing they exist explains mysterious
+errors later.
+
+## Inline functions
+
+```cpp
+inline int square(int x) { return x * x; }
+```
+
+`inline` tells the compiler "it's OK if this appears in multiple translation
+units — de-duplicate at link time." It does **not** force inlining anymore. The
+compiler decides based on heuristics. Use `inline` on header-defined functions.
+
+## `constexpr` functions
+
+```cpp
+constexpr int factorial(int n) {
+    return n <= 1 ? 1 : n * factorial(n - 1);
+}
+
+constexpr int x = factorial(6);  // computed at compile time
+```
+
+`constexpr` functions can run at compile time if their arguments are constant
+expressions. The same function still works at runtime. Huge win for zero-cost
+abstraction.
+
+## `[[nodiscard]]`
+
+```cpp
+[[nodiscard]] std::expected<int, Error> parse(std::string_view s);
+```
+
+If a caller ignores the return value, the compiler warns. Use on every
+fallible function.
+
+## Lambdas — the preview
+
+```cpp
+auto sq = [](int x) { return x * x; };
+std::cout << sq(5);    // 25
+```
+
+Anonymous functions. We'll cover them properly in lesson 15 — for now, know
+they exist and are often the right tool.
+
+## Exercises
+
+1. Write `min` and `max` as overloaded functions: integer, double, and
+   `std::string` versions.
+2. Write `factorial` as both a regular function and a `constexpr` function.
+   Verify with `static_assert` that the `constexpr` version runs at compile
+   time.
+3. Write a function that takes a `std::vector<int>&` and doubles every element
+   in place. Do it again without modifying the caller's vector.
+4. Use `[[nodiscard]]` on a function and confirm your compiler warns when the
+   return is ignored.

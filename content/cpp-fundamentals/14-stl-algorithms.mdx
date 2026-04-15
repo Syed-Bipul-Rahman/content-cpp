@@ -1,0 +1,136 @@
+---
+title: STL algorithms and iterators
+description: Loops you stop writing by hand once you know the standard algorithms.
+---
+
+# STL algorithms
+
+Most of the loops you write are a special case of a named algorithm.
+`<algorithm>` and `<numeric>` ship hundreds of them — the ones you'll reach
+for constantly are below.
+
+Algorithms operate on **iterator ranges** `[first, last)` — half-open,
+exclusive at the end. `begin()` is first, `end()` is one past the last.
+
+## Reading
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+std::vector<int> v{3, 1, 4, 1, 5, 9, 2, 6};
+
+auto sum = std::accumulate(v.begin(), v.end(), 0);    // 31
+auto n   = std::count(v.begin(), v.end(), 1);         // 2
+auto it  = std::find(v.begin(), v.end(), 4);          // iterator to the 4
+bool any = std::any_of(v.begin(), v.end(), [](int x){ return x > 5; });
+bool all = std::all_of(v.begin(), v.end(), [](int x){ return x >= 0; });
+```
+
+## Modifying
+
+```cpp
+std::fill(v.begin(), v.end(), 0);
+std::iota(v.begin(), v.end(), 1);        // fill with 1, 2, 3, …
+std::replace(v.begin(), v.end(), 4, 42); // replace 4 with 42
+std::reverse(v.begin(), v.end());
+```
+
+## Sorting and partitioning
+
+```cpp
+std::sort(v.begin(), v.end());
+std::sort(v.begin(), v.end(), std::greater<>());      // descending
+
+std::stable_sort(v.begin(), v.end());                 // preserves equal elements' order
+
+auto mid = std::partition(v.begin(), v.end(),
+    [](int x){ return x < 5; });    // mid points to first not-less-than-5
+```
+
+## Transforming
+
+```cpp
+std::vector<int> src{1, 2, 3};
+std::vector<int> dst(3);
+std::transform(src.begin(), src.end(), dst.begin(),
+    [](int x){ return x * x; });    // dst is {1, 4, 9}
+```
+
+## Set operations (on sorted ranges)
+
+```cpp
+std::vector<int> a{1, 2, 3, 4}, b{3, 4, 5, 6}, out;
+std::set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+    std::back_inserter(out));        // out = {3, 4}
+```
+
+## Binary search (on sorted ranges)
+
+```cpp
+bool present = std::binary_search(v.begin(), v.end(), 5);
+auto it = std::lower_bound(v.begin(), v.end(), 5);   // first >= 5
+auto jt = std::upper_bound(v.begin(), v.end(), 5);   // first > 5
+```
+
+## `std::ranges` (C++20) — less typing
+
+```cpp
+#include <ranges>
+
+std::ranges::sort(v);
+auto it = std::ranges::find(v, 4);
+auto sq = v | std::views::transform([](int x){ return x * x; })
+            | std::views::filter([](int x){ return x > 5; });
+for (int x : sq) std::cout << x;
+```
+
+Ranges compose. They don't allocate intermediate collections — the work is
+lazy.
+
+## Iterator categories
+
+- **Input** — read once, move forward (streams).
+- **Forward** — read many times, move forward.
+- **Bidirectional** — forward + backward (list, map, set).
+- **Random access** — jump in O(1) (vector, array, deque).
+
+Each algorithm documents the category it needs. `std::sort` needs random
+access. `std::find` needs only input.
+
+## Back inserters, front inserters
+
+To append output without pre-sizing:
+
+```cpp
+std::vector<int> dst;
+std::copy_if(src.begin(), src.end(), std::back_inserter(dst),
+    [](int x){ return x > 0; });
+```
+
+## Execution policies (C++17)
+
+```cpp
+#include <execution>
+
+std::sort(std::execution::par, v.begin(), v.end());
+```
+
+Parallel sort if your implementation supports it — one line change.
+
+## Why bother
+
+A `std::sort` call is clearer, shorter, safer, and usually faster than
+hand-rolled quicksort. Same for the rest. Learn the vocabulary — your loops
+will shrink.
+
+## Exercises
+
+1. Read integers from stdin into a vector. Print: mean, median, mode.
+   All via STL algorithms.
+2. Given two sorted vectors, compute their symmetric difference with
+   `std::set_symmetric_difference`.
+3. Use `ranges::views::iota` and `ranges::views::filter` to print the first 20
+   even numbers.
+4. Implement your own `find_if` taking iterators and a predicate. Compare
+   the assembly to `std::find_if` at `-O2`.

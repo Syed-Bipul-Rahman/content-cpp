@@ -1,0 +1,32 @@
+---
+title: Build Your Own Operating System — Overview
+description: Bootloader → kernel → paging → scheduler → filesystem → shell. x86-64 from scratch.
+---
+
+# Build Your Own Operating System
+
+Bootloader → kernel → paging → scheduler → filesystem → shell. x86-64 from scratch.
+
+## What you'll build
+
+- Write a bootloader that goes from real mode to 64-bit long mode
+- Set up GDT, IDT, interrupt handlers
+- Implement paging and a physical/virtual memory manager
+- Build a cooperative, then preemptive, scheduler
+- Drive the PIT, keyboard, framebuffer, and ATA disk
+- Implement a simple filesystem (FAT-like)
+- Run it in QEMU — then on real hardware
+
+## The core idea
+
+The deepest track on the site. You'll touch every layer the OS sits between. It will take weeks. It will change how you think about computers.
+
+## Prerequisites
+
+- Everything else. Seriously. Do pointers, concurrency, and at least the shell track first.
+
+## Where this sits in the curriculum
+
+This track is part of [learncpp.dev's 25+ project sequence](/projects). Do the
+[C++ Fundamentals](/learn/cpp-fundamentals) first. The next lessons in this
+track walk you through the build step by step.

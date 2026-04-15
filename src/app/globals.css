@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ink: #0a0a0a;
+  --paper: #ffffff;
+  --mute: #6e6e73;
+  --line: #d2d2d7;
+  --soft: #f5f5f7;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+::selection { background: var(--ink); color: var(--paper); }
+
+.prose-cpp {
+  @apply text-[17px] leading-[1.7] text-ink;
+}
+.prose-cpp h1 { @apply text-display font-semibold tracking-tight mt-0 mb-6; }
+.prose-cpp h2 { @apply text-3xl font-semibold tracking-tight mt-16 mb-4 border-b border-line pb-2; }
+.prose-cpp h3 { @apply text-xl font-semibold tracking-tight mt-10 mb-3; }
+.prose-cpp p  { @apply my-5; }
+.prose-cpp a  { @apply underline underline-offset-4 decoration-line hover:decoration-ink transition-colors; }
+.prose-cpp ul { @apply list-disc pl-6 my-5 space-y-2; }
+.prose-cpp ol { @apply list-decimal pl-6 my-5 space-y-2; }
+.prose-cpp blockquote { @apply border-l-2 border-ink pl-5 my-6 text-mute italic; }
+.prose-cpp code:not(pre code) {
+  @apply font-mono text-[0.9em] bg-soft px-1.5 py-0.5 rounded border border-line;
+}
+.prose-cpp pre {
+  @apply font-mono text-[14px] leading-[1.6] bg-ink text-paper rounded-xl p-5 my-6 overflow-x-auto;
+}
+.prose-cpp pre code { @apply bg-transparent p-0 border-0; }
+.prose-cpp hr { @apply my-12 border-line; }
+.prose-cpp table { @apply w-full my-6 border-collapse; }
+.prose-cpp th, .prose-cpp td { @apply border border-line px-3 py-2 text-left; }
+
+/* shiki */
+pre [data-line] { padding: 0 1rem; }
+[data-rehype-pretty-code-figure] pre { @apply !px-0; }
+[data-rehype-pretty-code-title] {
+  @apply bg-soft text-ink text-xs font-mono px-4 py-2 rounded-t-xl border border-line border-b-0;
+}
+[data-rehype-pretty-code-title] + pre { @apply !rounded-t-none; }

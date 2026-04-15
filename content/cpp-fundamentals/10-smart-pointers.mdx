@@ -1,0 +1,139 @@
+---
+title: unique_ptr, shared_ptr, weak_ptr
+description: The three smart pointers and when each is the right call.
+---
+
+# Smart pointers
+
+Raw `new`/`delete` is a leak waiting to happen. **Smart pointers** are RAII
+wrappers around heap allocations — they call `delete` for you, automatically,
+when they go out of scope. You will use them for almost every heap allocation
+in modern C++.
+
+All three live in `<memory>`.
+
+## `std::unique_ptr<T>` — single owner
+
+```cpp
+#include <memory>
+
+auto p = std::make_unique<int>(42);
+*p = 99;
+// when p goes out of scope, the int is deleted
+```
+
+- Exactly one owner.
+- Non-copyable.
+- **Movable** — you hand off ownership.
+- Zero runtime overhead vs a raw pointer.
+
+```cpp
+std::unique_ptr<int> a = std::make_unique<int>(1);
+std::unique_ptr<int> b = std::move(a);   // a is now null; b owns it
+```
+
+This is the **default choice**. 90% of heap allocations should be
+`unique_ptr`.
+
+### Polymorphism with unique_ptr
+
+```cpp
+struct Shape { virtual ~Shape() = default; virtual double area() const = 0; };
+struct Circle : Shape { /* ... */ };
+
+std::unique_ptr<Shape> s = std::make_unique<Circle>(5.0);
+s->area();
+```
+
+### Custom deleter
+
+```cpp
+auto file = std::unique_ptr<FILE, decltype(&std::fclose)>(
+    std::fopen("data", "r"), &std::fclose);
+```
+
+Now `fclose` runs on scope exit. No need to write a full RAII class for one-off
+C resources.
+
+## `std::shared_ptr<T>` — many owners
+
+```cpp
+auto p = std::make_shared<int>(42);
+auto q = p;   // both point at the same int. ref-count = 2
+// when both leave scope, the int is deleted
+```
+
+- Reference-counted.
+- Copyable.
+- Thread-safe **for the control block** — the count. Not for the pointee.
+- Two words on the stack (pointer + control block pointer); allocation is
+  larger than `make_unique`.
+
+Use `shared_ptr` only when ownership is **genuinely** shared — when you can't
+name a single owner. Almost always, you can.
+
+### `make_shared` vs `new`
+
+```cpp
+auto p = std::make_shared<Big>(args);   // 1 allocation — object + control block
+auto q = std::shared_ptr<Big>(new Big); // 2 allocations — don't
+```
+
+Always prefer `make_shared`.
+
+## `std::weak_ptr<T>` — non-owning observer
+
+```cpp
+auto shared = std::make_shared<int>(42);
+std::weak_ptr<int> weak = shared;
+
+if (auto locked = weak.lock()) {
+    // use *locked — it's a shared_ptr, safe to deref
+} else {
+    // the object is gone
+}
+```
+
+A `weak_ptr` doesn't contribute to the ref count. You upgrade to a `shared_ptr`
+via `lock()` — if the object still exists.
+
+Used to **break cycles** in shared ownership graphs:
+
+```cpp
+struct Node {
+    std::vector<std::shared_ptr<Node>> children;
+    std::weak_ptr<Node> parent;   // weak — avoids cycle
+};
+```
+
+## Raw pointers — still have a job
+
+Use raw pointers (or references) for **non-owning** parameters and fields:
+
+```cpp
+void process(Widget* w);          // I'll use it, not destroy it
+void process(const Widget& w);    // same, and can't be null
+```
+
+Never pass a `unique_ptr<T>` or `shared_ptr<T>` by value or by reference just
+to "be safe". If the function isn't taking ownership, it shouldn't see the
+smart pointer.
+
+## Decision flowchart
+
+```
+Does this function create an object that outlives the function?  → unique_ptr
+Is ownership genuinely shared across independent code paths?      → shared_ptr
+Do you need to observe a shared object without owning it?         → weak_ptr
+Everything else (parameters, short-lived use)                     → raw pointer or reference
+```
+
+## Exercises
+
+1. Rewrite a program that uses `new`/`delete` to use `unique_ptr` exclusively.
+   Confirm with a leak checker.
+2. Build a tree where parents own children via `shared_ptr` and children refer
+   back via `weak_ptr`. Confirm there's no cycle leak.
+3. Write a factory function that returns a `std::unique_ptr<Shape>` given a
+   `Shape::Kind` enum.
+4. Wrap `malloc`/`free` in a `unique_ptr` with a custom deleter.

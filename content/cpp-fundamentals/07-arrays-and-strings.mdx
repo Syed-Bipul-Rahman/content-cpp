@@ -1,0 +1,143 @@
+---
+title: Arrays, C-strings, and std::string
+description: Sequences of bytes — the low-level reality, and the modern abstractions.
+---
+
+# Arrays and strings
+
+Every real program moves bytes around. In C++ you have four options for a
+sequence of data: **C arrays**, **`std::array`**, **`std::vector`**, and
+**`std::string`** (plus `std::string_view`). This lesson covers the first and
+last; vectors get their own treatment in the STL lessons.
+
+## C arrays
+
+```cpp
+int nums[5]{1, 2, 3, 4, 5};        // size known at compile time
+nums[0] = 99;                       // indexing
+int n = nums[4];
+int count = sizeof(nums) / sizeof(nums[0]);  // 5, but only before decay
+```
+
+A C array is a fixed-size, contiguous block of memory. Its name **decays** to
+a pointer to the first element in most expressions. That's why functions can't
+tell how long an array parameter is:
+
+```cpp
+void f(int arr[5]) {
+    // sizeof(arr) is sizeof(int*), NOT 5 * sizeof(int)
+}
+```
+
+Pass the size alongside, or — better — use `std::span` or `std::vector`.
+
+## `std::array` — fixed-size, safer
+
+```cpp
+#include <array>
+
+std::array<int, 5> nums{1, 2, 3, 4, 5};
+nums.size();      // 5, always
+nums[0];          // unchecked
+nums.at(0);       // bounds-checked, throws on oob
+```
+
+Same performance as a C array, with a proper type. Use it when size is known
+at compile time.
+
+## C-strings
+
+A C-string is a `char` array with a trailing `'\0'`. Every library function
+that takes `const char*` expects that terminator.
+
+```cpp
+const char* s = "hello";   // stores 6 bytes: h e l l o \0
+std::size_t n = std::strlen(s);  // 5 — does not count \0
+```
+
+C-strings are dangerous:
+
+- No size tracking.
+- Buffer overflows if you forget the terminator.
+- Every operation is O(n).
+
+You'll work with them at API boundaries (OS calls, C libraries). For your own
+code: use `std::string` or `std::string_view`.
+
+## `std::string` — owning, dynamic
+
+```cpp
+#include <string>
+
+std::string s = "hello";
+s += ", world";              // grows as needed
+s.size();                    // 12
+s[0];                        // 'h'
+s.substr(0, 5);              // "hello"
+s.find("world");             // position
+```
+
+`std::string` owns its buffer, resizes on demand, and stores a size separately
+from any terminator (though it keeps one for C-string interop).
+
+Common operations:
+
+```cpp
+std::string name = "Alice";
+name.length();                   // 5
+name.push_back('!');             // "Alice!"
+name.append(" Smith");           // "Alice! Smith"
+auto words = name + " " + "Bob"; // concat
+std::string(10, 'x');            // "xxxxxxxxxx"
+std::to_string(42);              // "42"
+```
+
+## `std::string_view` (C++17) — non-owning
+
+```cpp
+#include <string_view>
+
+void print(std::string_view sv) {
+    std::cout << sv << '\n';
+}
+
+print("hello");                  // from a literal — no allocation
+print(my_string);                // from a std::string — no allocation
+print(my_string.substr(0, 5));   // careful: the substr allocates for string;
+                                 // string_view would not
+```
+
+A `string_view` is a **pointer + length**. It's the right parameter type when:
+
+- You only read the string.
+- You don't need to outlive the caller's string.
+
+**Never** store a `string_view` beyond the lifetime of its underlying buffer.
+
+## Conversion and parsing
+
+```cpp
+int i = std::stoi("42");
+double d = std::stod("3.14");
+std::string s = std::to_string(42);
+```
+
+For more control (and no exceptions), use `std::from_chars` / `std::to_chars`
+from `<charconv>` — the fastest, allocation-free option.
+
+## Unicode, briefly
+
+`std::string` holds **bytes**, not characters. UTF-8 "just works" for most
+purposes, but indexing is byte-indexing. If you need real text manipulation
+(grapheme clusters, case-folding), reach for a library (ICU, utfcpp). Don't
+hand-roll it.
+
+## Exercises
+
+1. Implement `strlen` in one line using a `while` loop. Then profile it against
+   `std::strlen` on a 1 MB string.
+2. Write a function `split(std::string_view s, char delim) -> std::vector<std::string_view>`.
+   Make sure you document the lifetime contract.
+3. Write `reverse_words("hello world")` → `"world hello"`.
+4. Read a file line-by-line with `std::getline` into a `std::vector<std::string>`.
+5. Use `std::from_chars` to parse an integer without allocating.

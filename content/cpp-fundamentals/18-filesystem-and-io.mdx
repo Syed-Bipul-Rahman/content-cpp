@@ -1,0 +1,188 @@
+---
+title: Files, streams, and std::filesystem
+description: Reading, writing, and navigating the filesystem.
+---
+
+# Files and I/O
+
+Every project track on this site touches the filesystem. Web servers serve
+files. Databases persist pages. Shells run binaries. Compilers read sources.
+This lesson is the plumbing.
+
+## Streams
+
+C++ standard I/O is built on **streams** — objects you insert into or extract
+from with `<<` / `>>`.
+
+| Stream | Source / Sink |
+| --- | --- |
+| `std::cin` | standard input |
+| `std::cout` | standard output |
+| `std::cerr` | standard error (unbuffered) |
+| `std::clog` | standard error (buffered) |
+
+## Reading from stdin
+
+```cpp
+int n;
+std::cin >> n;
+
+std::string word;
+std::cin >> word;            // reads one whitespace-delimited token
+
+std::string line;
+std::getline(std::cin, line); // reads a line (without the newline)
+```
+
+After any extraction, check the stream:
+
+```cpp
+if (!(std::cin >> n)) {
+    std::cerr << "expected an integer\n";
+    return 1;
+}
+```
+
+## Writing
+
+```cpp
+std::cout << "count=" << 42 << " value=" << 3.14 << '\n';
+```
+
+Prefer `'\n'` over `std::endl`. `endl` flushes the buffer, which is slow in a
+loop.
+
+## File streams
+
+```cpp
+#include <fstream>
+
+std::ifstream in{"data.txt"};
+if (!in) {
+    std::cerr << "cannot open\n";
+    return 1;
+}
+
+std::string line;
+while (std::getline(in, line)) {
+    process(line);
+}
+
+std::ofstream out{"out.txt"};
+out << "hello\n";
+```
+
+`ifstream`/`ofstream` are RAII — the file closes when the object is destroyed.
+
+Binary mode:
+
+```cpp
+std::ifstream in{"image.bin", std::ios::binary};
+std::vector<char> bytes{std::istreambuf_iterator<char>(in), {}};
+```
+
+## String streams
+
+Treat a string as a stream:
+
+```cpp
+#include <sstream>
+
+std::istringstream iss{"42 3.14 hello"};
+int i; double d; std::string s;
+iss >> i >> d >> s;
+
+std::ostringstream oss;
+oss << "x=" << 42;
+std::string result = oss.str();
+```
+
+Useful for parsing and building formatted strings.
+
+## `std::format` (C++20)
+
+```cpp
+#include <format>
+
+std::string s = std::format("{} = {:.2f}", "pi", 3.14159);
+// "pi = 3.14"
+```
+
+Type-safe, readable, fast. Use it instead of `sprintf` or stream
+concatenation.
+
+## `std::filesystem`
+
+```cpp
+#include <filesystem>
+namespace fs = std::filesystem;
+
+fs::path p = "data/logs/2024-01-01.log";
+p.parent_path();     // "data/logs"
+p.filename();        // "2024-01-01.log"
+p.extension();       // ".log"
+
+fs::exists(p);
+fs::is_directory(p);
+fs::file_size(p);
+fs::remove(p);
+fs::create_directories("a/b/c");
+fs::rename("old", "new");
+
+for (const auto& entry : fs::directory_iterator{"."}) {
+    std::cout << entry.path() << '\n';
+}
+
+for (const auto& entry : fs::recursive_directory_iterator{"."}) {
+    if (entry.is_regular_file()) use(entry.path());
+}
+```
+
+`<filesystem>` replaces a decade of `readdir`/`stat`/`unlink` boilerplate.
+
+## Reading a whole file efficiently
+
+```cpp
+std::string read_file(const fs::path& p) {
+    std::ifstream in{p, std::ios::binary};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+```
+
+For huge files, **don't** read them all — stream them.
+
+## Writing safely
+
+```cpp
+// atomic write: write to temp, then rename
+fs::path tmp = target.string() + ".tmp";
+{
+    std::ofstream out{tmp};
+    out << content;
+}  // closes
+fs::rename(tmp, target);   // atomic on POSIX
+```
+
+This pattern protects against partial writes during a crash.
+
+## Low-level I/O
+
+For maximum performance, skip streams entirely:
+
+```cpp
+#include <cstdio>
+FILE* f = std::fopen("data", "rb");
+// or, on POSIX, open(2) + read(2) + write(2) for syscalls directly
+```
+
+You'll drop to this level in the webserver and database tracks.
+
+## Exercises
+
+1. Write `cat` — read files named on the command line, print to stdout.
+2. Write `wc` — count lines, words, bytes.
+3. Write `du` — print total size of a directory recursively.
+4. Implement atomic config-file write as shown above. Test by killing mid-write.
+5. Benchmark reading a 100 MB file with `ifstream` vs `fread` vs `mmap`.

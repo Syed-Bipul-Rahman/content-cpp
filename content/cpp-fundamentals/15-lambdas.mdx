@@ -1,0 +1,145 @@
+---
+title: Lambdas, std::function, and closures
+description: Anonymous functions, captures, and the machinery behind them.
+---
+
+# Lambdas
+
+A lambda is a function you write **inline**, right where it's used. Every STL
+algorithm, every callback, every asynchronous task in modern C++ uses them.
+
+## Syntax
+
+```cpp
+auto add = [](int a, int b) { return a + b; };
+add(2, 3);   // 5
+```
+
+Anatomy:
+
+```
+[capture] (parameters) -> return_type { body }
+```
+
+- `[capture]` — variables from the enclosing scope to use inside.
+- `(params)` — like a function's parameter list.
+- `-> return` — optional; usually deduced.
+- `{ body }` — the code.
+
+## Captures
+
+```cpp
+int offset = 10;
+
+auto by_value  = [offset](int x) { return x + offset; };   // captured by copy
+auto by_ref    = [&offset](int x) { return x + offset; };  // by reference
+auto all_val   = [=](int x) { return x + offset; };        // capture everything by copy
+auto all_ref   = [&](int x) { return x + offset; };        // by reference
+auto mixed     = [=, &offset](int x) { return x + offset; }; // offset by ref, rest by copy
+```
+
+Rules:
+
+- Capture by value when you want a snapshot.
+- Capture by reference when the lambda outlives none of the captured variables.
+- **Never** capture references to local variables that will go out of scope
+  before the lambda is called. Classic bug.
+
+## `mutable`
+
+Captures by value are `const` inside the lambda. To modify the copy:
+
+```cpp
+int i = 0;
+auto next = [i]() mutable { return ++i; };
+next(); next(); next();   // 1, 2, 3
+```
+
+Each call modifies the lambda's *own* copy, not the caller's `i`.
+
+## Capturing `this`
+
+Inside a class method:
+
+```cpp
+class Button {
+public:
+    void on_click(std::function<void()> f) { callback = std::move(f); }
+
+    void setup() {
+        on_click([this] { this->handle(); });   // captures the pointer
+    }
+
+    void handle() { /* ... */ }
+
+private:
+    std::function<void()> callback;
+};
+```
+
+Careful: `this` is a raw pointer. If the `Button` is destroyed before the
+callback runs, it's a use-after-free. Use `weak_ptr` + `lock()` for async
+work on shared objects.
+
+## Lambdas *are* objects
+
+Every lambda has a unique anonymous type. The compiler generates something
+like:
+
+```cpp
+struct __Lambda_42 {
+    int captured_offset;
+    int operator()(int x) const { return x + captured_offset; }
+};
+```
+
+That's why `auto` is the natural storage — every lambda is its own type.
+
+## `std::function<R(Args...)>` — type-erased storage
+
+When you need to store heterogeneous callables:
+
+```cpp
+#include <functional>
+
+std::vector<std::function<int(int)>> ops;
+ops.push_back([](int x){ return x + 1; });
+ops.push_back([](int x){ return x * 2; });
+```
+
+`std::function` can hold any callable with a matching signature — lambdas,
+function pointers, functors. It has a small allocation and virtual-call cost.
+
+For performance-critical hot paths, prefer templates (pass the lambda type as
+`T`) over `std::function`.
+
+## Generic lambdas (C++14)
+
+```cpp
+auto print = [](auto x) { std::cout << x; };
+print(42);
+print("hello");
+```
+
+The lambda becomes a template. It generates a new operator() per call type.
+
+## Immediately-invoked lambdas
+
+Useful to initialize `const` values with logic:
+
+```cpp
+const int config = [] {
+    if (some_condition) return 1;
+    return 2;
+}();
+```
+
+## Exercises
+
+1. Write a `make_counter()` factory that returns a lambda with a mutable
+   capture starting at 0. Each call returns the next integer.
+2. Pass a custom comparator lambda to `std::sort` to sort strings by length.
+3. Store a callable in a `std::function` and another in a template parameter.
+   Benchmark invocation in a tight loop. Which is faster and by how much?
+4. Write a retry helper that takes a callable and an int `attempts`, and
+   retries until success or the count is exhausted.

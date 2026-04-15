@@ -1,0 +1,113 @@
+---
+title: Your toolchain — compiler, linker, build system
+description: Set up a real C++ development environment that won't fight you later.
+---
+
+# Your toolchain
+
+You need three tools: a **compiler**, a **build system**, and a **debugger**.
+Everything on this site assumes you have them installed and working. This
+lesson gets you there.
+
+## Pick a compiler
+
+There are three mainstream C++ compilers. Any of them works.
+
+| Platform | Recommended | How to install |
+| --- | --- | --- |
+| macOS | **Clang** (Apple's) | `xcode-select --install` |
+| Linux | **GCC** | `sudo apt install build-essential` (Debian/Ubuntu) |
+| Windows | **MSVC** via Visual Studio, or **MinGW-w64**, or **WSL + GCC** | Recommended: install WSL and use Linux |
+
+Verify:
+
+```bash
+g++ --version    # or clang++ --version
+```
+
+You want C++20 or newer. On older systems, install a newer compiler from your
+package manager.
+
+## Build system: CMake
+
+You *can* call `g++` directly forever. You shouldn't — once a project has more
+than one file, you want a build system. We use **CMake**. It's the de-facto
+standard in C++ and it's what all the project tracks on this site use.
+
+```bash
+# Debian/Ubuntu
+sudo apt install cmake
+# macOS
+brew install cmake
+```
+
+A minimal `CMakeLists.txt`:
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(hello CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(hello hello.cpp)
+target_compile_options(hello PRIVATE -Wall -Wextra -Wpedantic)
+```
+
+Build it:
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/hello
+```
+
+## Debugger
+
+- **Linux**: `gdb`
+- **macOS**: `lldb` (ships with Xcode)
+- **Windows**: Visual Studio's built-in debugger, or `gdb` under WSL
+
+Basic debug loop:
+
+```bash
+g++ -std=c++20 -g -O0 -o hello hello.cpp   # -g = debug info
+gdb ./hello
+(gdb) break main
+(gdb) run
+(gdb) next
+```
+
+## Sanitizers
+
+These will save you dozens of hours. Enable them in debug builds:
+
+```bash
+g++ -std=c++20 -g -fsanitize=address,undefined -o hello hello.cpp
+```
+
+Address Sanitizer (`asan`) catches memory errors — use-after-free, buffer
+overflow, leaks. Undefined Behavior Sanitizer (`ubsan`) catches signed overflow,
+misaligned loads, and friends. Use them.
+
+## Editor
+
+Any editor that supports **clangd** (the LSP server for C++) will work — VS
+Code, Neovim, Helix, Zed, CLion. Install `clangd`, then:
+
+```bash
+cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+ln -sf build/compile_commands.json .
+```
+
+Your editor now gets completions, go-to-definition, and real-time diagnostics.
+
+## Checklist
+
+Before moving on, you should be able to:
+
+- Compile `hello.cpp` with `-std=c++20 -Wall -Wextra` and get no warnings.
+- Build the same file via CMake.
+- Run it under a debugger and hit a breakpoint.
+- Build it with sanitizers enabled.
+
+If any of those don't work, fix that now. Every lesson from here on assumes
+they do.

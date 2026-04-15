@@ -1,0 +1,196 @@
+---
+title: Threads, mutexes, atomics, and memory order
+description: Running code on multiple cores without corrupting everything.
+---
+
+# Concurrency
+
+Modern CPUs have many cores. To use them, you run multiple **threads** — each
+a sequence of instructions executing in parallel with the others, **sharing**
+memory. That sharing is where every concurrency bug lives.
+
+## Threads
+
+```cpp
+#include <thread>
+
+void worker(int id) {
+    std::cout << "hello from " << id << '\n';
+}
+
+int main() {
+    std::thread t{worker, 1};
+    t.join();    // wait for t to finish; MUST join or detach before destruction
+}
+```
+
+- `join()` waits for the thread to finish.
+- `detach()` lets it run independently — you can't wait for it anymore.
+- Forgetting both → `std::terminate()`.
+
+### `std::jthread` (C++20)
+
+```cpp
+std::jthread t{worker, 1};
+// joins automatically on destruction. Also supports cancellation.
+```
+
+Use `jthread` in new code.
+
+## The problem: data races
+
+```cpp
+int counter = 0;
+
+void inc() {
+    for (int i = 0; i < 100'000; ++i) ++counter;
+}
+
+std::jthread t1{inc};
+std::jthread t2{inc};
+// after: counter might be anywhere from 100k to 200k
+```
+
+Two threads reading and writing the same memory without synchronization is a
+**data race** — undefined behavior. The compiler and CPU can reorder your
+code; increments can be lost.
+
+## `std::mutex`
+
+```cpp
+#include <mutex>
+
+std::mutex m;
+int counter = 0;
+
+void inc() {
+    for (int i = 0; i < 100'000; ++i) {
+        std::lock_guard lock{m};
+        ++counter;
+    }
+}
+```
+
+A mutex ensures **mutual exclusion** — only one thread inside the critical
+section at a time.
+
+- `std::lock_guard` — RAII-locks on construction, unlocks on destruction.
+- `std::unique_lock` — same, but lets you unlock early, defer lock, etc.
+- `std::scoped_lock` (C++17) — locks multiple mutexes without deadlock.
+
+Never lock manually with `mutex::lock()` and `mutex::unlock()`. Always RAII.
+
+## Deadlock
+
+Two threads, each holding one lock, each waiting for the other. Program hangs.
+Prevention:
+
+- Always lock in the same order.
+- Use `std::scoped_lock{a, b}` to lock multiple mutexes atomically.
+- Hold locks for as little code as possible.
+
+## Condition variables
+
+For threads to **wait** for a condition:
+
+```cpp
+std::mutex m;
+std::condition_variable cv;
+std::queue<Task> tasks;
+bool stop = false;
+
+void producer(Task t) {
+    {
+        std::lock_guard lock{m};
+        tasks.push(t);
+    }
+    cv.notify_one();
+}
+
+void consumer() {
+    std::unique_lock lock{m};
+    cv.wait(lock, [] { return !tasks.empty() || stop; });
+    if (stop) return;
+    Task t = std::move(tasks.front());
+    tasks.pop();
+    lock.unlock();
+    run(t);
+}
+```
+
+The predicate argument to `wait` protects against spurious wakeups.
+
+## `std::atomic<T>`
+
+Lock-free operations on a single value:
+
+```cpp
+#include <atomic>
+
+std::atomic<int> counter{0};
+
+void inc() {
+    for (int i = 0; i < 100'000; ++i) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+```
+
+Atomics are much faster than mutexes for simple counters and flags. But they
+only work on **one variable at a time**.
+
+## Memory order
+
+`memory_order` controls how atomic operations synchronize memory across threads.
+
+| Order | Meaning |
+| --- | --- |
+| `relaxed` | atomicity only, no ordering guarantees |
+| `acquire` / `release` | pair up to make a handoff visible |
+| `seq_cst` (default) | global ordering, strongest and slowest |
+
+Rule of thumb: **use the default `seq_cst` until a profiler tells you
+otherwise**. Getting weaker orderings right is hard.
+
+## `std::async` and futures
+
+```cpp
+#include <future>
+
+auto fut = std::async(std::launch::async, [] {
+    return heavy_compute();
+});
+
+int result = fut.get();   // blocks until ready
+```
+
+One-shot asynchronous work with a return value. Easy, but less flexible than
+building your own thread pool for the project tracks.
+
+## Thread-local storage
+
+```cpp
+thread_local int tls_counter = 0;
+```
+
+Each thread sees its own copy. Handy for caches, RNGs, and context pointers.
+
+## Rules of the road
+
+1. **Share by default, mutate by exception.** Multiple readers fine, one writer
+   must serialize.
+2. **Prefer message passing (queues) to shared state.**
+3. **Lock short, lock scoped.** Never hold a lock across I/O.
+4. **Prove absence of races with `-fsanitize=thread` (TSan).** It works.
+5. **Start with mutexes. Graduate to atomics only when you can justify it.**
+
+## Exercises
+
+1. Write a thread-safe counter class with a `std::atomic<int>`.
+2. Build a bounded producer/consumer queue with a mutex and two condition
+   variables.
+3. Write a thread pool: N worker threads, a task queue, `submit(callable)`
+   returns a `std::future`.
+4. Trigger a race in two-thread code, run it under TSan, read the report.
+5. Read Jeff Preshing on acquire/release, then re-do the counter with
+   `memory_order_relaxed` and explain why it's safe (hint: it is).

@@ -1,0 +1,124 @@
+---
+title: Types, variables, and the stack
+description: How C++ stores data, what types really are, and where your variables live.
+---
+
+# Types, variables, and the stack
+
+A variable in C++ is not a label. It's **a named region of memory with a
+declared type**. The type tells the compiler two things: how many bytes to
+reserve, and how to interpret those bytes. That's it. Everything else follows.
+
+## Fundamental types
+
+```cpp
+bool        flag = true;          // 1 byte
+char        letter = 'A';         // 1 byte
+int         count = 42;           // 4 bytes (typically)
+long        big = 1'000'000'000L; // 4 or 8 bytes, platform-dependent
+long long   huge = 1'000'000'000'000LL; // at least 8 bytes
+float       x = 3.14f;            // 4 bytes, ~7 digits precision
+double      y = 3.14;             // 8 bytes, ~15 digits precision
+```
+
+Sizes are not fixed by the standard — they're platform-dependent. If you need
+exact sizes, include `<cstdint>`:
+
+```cpp
+#include <cstdint>
+
+int8_t   i8  = -128;
+uint8_t  u8  = 255;
+int32_t  i32 = 1'000'000;
+uint64_t u64 = 18'000'000'000'000'000'000ULL;
+```
+
+Use these when you're touching file formats, network protocols, or any
+situation where the shape of the bytes matters. Use `int` for counters and
+indices otherwise.
+
+## Initialization — do it right
+
+There are four ways to initialize a variable. Only one is always safe.
+
+```cpp
+int a;         // UNINITIALIZED. Contents are garbage.
+int b = 0;     // copy-init
+int c(0);      // direct-init
+int d{0};      // brace-init — PREFER THIS
+```
+
+Why brace-init? Because it **refuses narrowing conversions**:
+
+```cpp
+int x = 3.14;    // compiles. x becomes 3. Silent truncation.
+int y{3.14};     // COMPILE ERROR. Good.
+```
+
+Rule of thumb: **use `{}` initialization everywhere**.
+
+## The stack
+
+Local variables live on the **stack** — a per-thread region of memory that
+grows and shrinks as functions are called and returned.
+
+```cpp
+void f() {
+    int x{10};        // stack frame allocates 4 bytes for x
+    int y{20};        // and 4 more for y
+}                     // on return, both are destroyed instantly
+```
+
+Allocation on the stack is essentially free — it's an adjustment to a register.
+Destruction is automatic. This is why C++ is fast: most of the time, you never
+touch the allocator at all.
+
+## `auto` — type inference
+
+When the type is obvious from the right-hand side, let the compiler figure it
+out:
+
+```cpp
+auto x = 42;              // int
+auto y = 3.14;            // double
+auto z = std::string{"hi"}; // std::string
+```
+
+Use `auto` when it makes code clearer, not as a way to hide types you should
+know.
+
+## `const` and `constexpr`
+
+```cpp
+const int max_retries = 3;       // value cannot change at runtime
+constexpr int buffer_size = 4096; // value known at COMPILE time
+```
+
+`constexpr` is stronger than `const`: the value must be computable while
+compiling. Use it for sizes, lookup tables, and anything you want baked into
+the binary.
+
+## Scope
+
+A variable exists from its declaration to the end of the enclosing `{ }`
+block. Outside that block, the name doesn't exist and the memory has been
+reclaimed.
+
+```cpp
+{
+    int local{5};
+    // local usable here
+}
+// local does not exist here
+```
+
+## Exercises
+
+1. Write a program that prints `sizeof` of every type in this lesson. Compare
+   results on different machines if you can.
+2. Try `int x = 2'147'483'648;`. Does it compile? What happens?
+3. Write a function that returns a pointer to a local variable. Compile with
+   `-Wall`. What does the compiler say, and why?
+4. Declare a `constexpr` array of the first 10 primes. Index into it at
+   runtime. Confirm via `objdump` or an assembly view that the values are in
+   the binary.

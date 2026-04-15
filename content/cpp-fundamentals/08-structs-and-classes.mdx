@@ -1,0 +1,195 @@
+---
+title: Structs, classes, and encapsulation
+description: Defining your own types. Members, methods, access, constructors.
+---
+
+# Structs and classes
+
+You can't model a real system with `int` and `string` alone. You need your own
+types — `Request`, `Player`, `Vec3`, `Connection`. In C++ you build them with
+`struct` and `class`.
+
+## `struct` — plain data, by default
+
+```cpp
+struct Point {
+    double x;
+    double y;
+};
+
+Point p{3.0, 4.0};
+std::cout << p.x << ", " << p.y << '\n';
+```
+
+A `struct` groups named fields. Access them with `.`.
+
+## Methods
+
+Types can contain functions:
+
+```cpp
+struct Point {
+    double x;
+    double y;
+
+    double length() const {
+        return std::sqrt(x * x + y * y);
+    }
+};
+
+Point p{3.0, 4.0};
+std::cout << p.length();   // 5.0
+```
+
+`const` at the end of a method means "I don't modify `*this`". Mark every
+read-only method `const`. Callers can only call `const` methods on `const`
+instances.
+
+## `class` vs `struct`
+
+The **only** difference: default access is `private` for `class`, `public` for
+`struct`. Convention is:
+
+- `struct` for plain data types (and to mark that all members are public).
+- `class` for types with invariants that must be protected.
+
+```cpp
+class Counter {
+public:
+    void increment()  { ++n; }
+    int  value() const { return n; }
+private:
+    int n{0};
+};
+```
+
+The counter invariant — "`n` only changes through `increment`" — is enforced
+by making `n` private.
+
+## Access specifiers
+
+- `public`    — anyone can use it.
+- `private`   — only this class.
+- `protected` — this class and derived classes.
+
+Default: `private` for `class`, `public` for `struct`. Prefer `private` members
+and a narrow public API.
+
+## Constructors
+
+Constructors run when an instance is created. They set up the invariant.
+
+```cpp
+class Rect {
+public:
+    Rect(double w, double h) : width{w}, height{h} {
+        if (w < 0 || h < 0) throw std::invalid_argument{"negative size"};
+    }
+
+    double area() const { return width * height; }
+
+private:
+    double width;
+    double height;
+};
+```
+
+The `: width{w}, height{h}` is the **member initializer list** — it
+initializes members directly, rather than default-constructing then assigning.
+Always prefer it.
+
+## Destructor
+
+Runs when an instance is destroyed (end of scope, `delete`, vector growth).
+Release resources here.
+
+```cpp
+class File {
+public:
+    explicit File(const char* path);
+    ~File();                  // close the handle
+private:
+    std::FILE* fp{nullptr};
+};
+```
+
+## Default member initializers
+
+You can give defaults inline:
+
+```cpp
+class Config {
+    int retries{3};
+    std::string name{"anon"};
+    bool verbose{false};
+};
+```
+
+Now you don't need to write a constructor just to default-initialize everything.
+
+## `explicit`
+
+Single-argument constructors can be used as implicit conversions. Stop that:
+
+```cpp
+class Meters {
+public:
+    explicit Meters(double v) : value{v} {}
+private:
+    double value;
+};
+
+void walk(Meters m);
+walk(Meters{5.0});   // OK
+walk(5.0);           // ERROR (good — prevents silent conversion)
+```
+
+Default to `explicit` on every single-argument constructor.
+
+## Getters, setters, and not overdoing it
+
+A `class` that exposes every field via a getter/setter pair has no invariant
+— you've just written a slower `struct`. Only add getters/setters if they
+**actually** enforce or compute something.
+
+## Aggregate initialization
+
+If a type has no user-declared constructors and all public members, you can
+brace-init it:
+
+```cpp
+struct Point { int x; int y; };
+Point p{1, 2};                // aggregate init
+
+struct Config { int retries{3}; bool verbose{false}; };
+Config c{.retries = 5};       // C++20 designated init
+```
+
+## Example: a real invariant
+
+```cpp
+class Temperature {
+public:
+    explicit Temperature(double kelvin) : k{kelvin} {
+        if (k < 0) throw std::invalid_argument{"kelvin cannot be negative"};
+    }
+    double kelvin()  const { return k; }
+    double celsius() const { return k - 273.15; }
+private:
+    double k;
+};
+```
+
+`k` is private. There's no way to create an invalid `Temperature`. Callers get
+two convenient views.
+
+## Exercises
+
+1. Write a `Vec3` struct with fields `x`, `y`, `z` and methods `length()`,
+   `dot(other)`, `operator+`.
+2. Write a `BankAccount` class with `deposit`, `withdraw`, `balance`. Withdraw
+   must never produce a negative balance.
+3. Convert the `BankAccount` into a `struct` and note how many ways you can
+   break it from outside.
+4. Write a `Clock` class that captures `std::chrono::steady_clock::now()` in
+   its constructor and prints elapsed time in its destructor.

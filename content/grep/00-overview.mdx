@@ -1,0 +1,32 @@
+---
+title: Build Your Own grep — Overview
+description: A fast file search tool — literals, regex, recursive directory walk.
+---
+
+# Build Your Own grep
+
+A fast file search tool — literals, regex, recursive directory walk.
+
+## What you'll build
+
+- Parse command-line flags (`-i`, `-v`, `-n`, `-r`)
+- Stream files line-by-line without loading them into memory
+- Match literal patterns, then extend to regex
+- Walk directories recursively
+- Print filename:line:match with color when stdout is a TTY
+
+## The core idea
+
+A grep is: for every line in every file, check if pattern matches, print if yes. The whole engineering exercise is doing it *fast* and *correctly* on huge inputs.
+
+## Prerequisites
+
+- Strings and I/O streams
+- Filesystem traversal
+- A feel for pattern matching (regex comes later in its own track)
+
+## Where this sits in the curriculum
+
+This track is part of [learncpp.dev's 25+ project sequence](/projects). Do the
+[C++ Fundamentals](/learn/cpp-fundamentals) first. The next lessons in this
+track walk you through the build step by step.

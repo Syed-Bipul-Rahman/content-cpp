@@ -1,0 +1,33 @@
+---
+title: Build Your Own Redis — Overview
+description: A single-threaded, event-driven key-value store speaking the RESP protocol.
+---
+
+# Build Your Own Redis
+
+A single-threaded, event-driven key-value store speaking the RESP protocol.
+
+## What you'll build
+
+- Speak the RESP wire protocol
+- Handle many connections with a single thread (epoll/kqueue)
+- Implement GET, SET, DEL, EXPIRE, INCR, LPUSH, HSET
+- Hash table with incremental rehashing
+- RDB snapshots and append-only file persistence
+- Master-replica replication
+
+## The core idea
+
+Redis taught a generation of engineers that **single-threaded + event-driven** can be faster than multi-threaded done poorly. We'll feel why firsthand.
+
+## Prerequisites
+
+- Networking basics
+- Pointers, RAII, move semantics
+- Hash tables
+
+## Where this sits in the curriculum
+
+This track is part of [learncpp.dev's 25+ project sequence](/projects). Do the
+[C++ Fundamentals](/learn/cpp-fundamentals) first. The next lessons in this
+track walk you through the build step by step.

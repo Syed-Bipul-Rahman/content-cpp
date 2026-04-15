@@ -1,0 +1,32 @@
+---
+title: Build Your Own Compiler — Overview
+description: A real compiler: frontend, IR, optimization, x86-64 codegen.
+---
+
+# Build Your Own Compiler
+
+A real compiler: frontend, IR, optimization, x86-64 codegen.
+
+## What you'll build
+
+- Lex and parse a C-like subset
+- Type-check and resolve names
+- Lower to a three-address IR
+- Do basic optimizations (constant folding, dead code elimination)
+- Generate x86-64 assembly
+- Link against libc and run native binaries
+
+## The core idea
+
+A compiler is a pipeline of transformations. Each stage is simple. The stages together produce something that can talk directly to your CPU. That's the magic.
+
+## Prerequisites
+
+- Regex engine or language track recommended first
+- Assembly basics (we'll teach what you need)
+
+## Where this sits in the curriculum
+
+This track is part of [learncpp.dev's 25+ project sequence](/projects). Do the
+[C++ Fundamentals](/learn/cpp-fundamentals) first. The next lessons in this
+track walk you through the build step by step.
