@@ -1,0 +1,155 @@
+---
+title: Prerequisites & mental model
+description: HTTP, sockets, and the picture of how a request becomes a response.
+---
+
+# Prerequisites & mental model
+
+A web server is a program that **listens on a TCP port**, **accepts**
+connections, **reads** an HTTP request, **writes** an HTTP response, and
+either **closes** or **reuses** the connection. Get this picture in your
+head and the rest is mechanics.
+
+## What you should already know
+
+- C++ Fundamentals through lesson 21, especially:
+  - Pointers, RAII, smart pointers
+  - Move semantics
+  - Concurrency basics
+  - Networking basics (sockets, TCP, byte order)
+- A shell — write one or read [our shell track](/projects/shell) first if
+  the term "fork" is unfamiliar.
+- Comfort reading `man` pages.
+
+## HTTP, the wire format
+
+HTTP is a text-based, line-oriented protocol. A request looks like:
+
+```
+GET /index.html HTTP/1.1
+Host: example.com
+User-Agent: curl/8.4.0
+Accept: */*
+
+```
+
+Each line ends with `\r\n`. A blank line marks the end of the headers. For
+`GET`, that's it — the request is over. For `POST`, a body follows whose
+length is given by the `Content-Length` header (or, for streaming, by
+`Transfer-Encoding: chunked`).
+
+A response looks like:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 13
+
+Hello, World!
+```
+
+Status line, headers, blank line, body. Done.
+
+## The HTTP/1.1 status line
+
+```
+<version> <code> <reason>\r\n
+```
+
+- `HTTP/1.1` — the version we'll speak.
+- Code — three digits. `2xx` success, `3xx` redirect, `4xx` client error,
+  `5xx` server error. The four to know cold: 200, 404, 400, 500.
+- Reason — human-readable. Browsers ignore it.
+
+## Connection lifecycle
+
+Old HTTP/1.0: one request, one response, close. Wasteful — TCP handshake
+each time.
+
+HTTP/1.1: **keep-alive by default**. The client sends multiple requests on
+the same socket. The server reads, responds, reads the next, responds, …
+until either side closes (or `Connection: close` is set).
+
+We'll get the simple "close after each" version working first, then add
+keep-alive in lesson 4.
+
+## Why C++ for a web server?
+
+Two reasons:
+
+1. **Performance**: ~1 µs per request when written carefully. Try matching
+   that in Python.
+2. **Understanding**: every layer is yours. No framework hides the syscalls.
+
+If you only care about (1), you'd use Nginx or something built on `io_uring`.
+We're here for (2).
+
+## What we'll skip (initially)
+
+- TLS. We serve plain HTTP. Run behind Nginx / Caddy if you need HTTPS in
+  production.
+- HTTP/2 and HTTP/3. Different framing, different mental model. Worth a
+  separate track.
+- Cookies / sessions / auth. Application-layer concerns, not server.
+
+## What we'll build (full list)
+
+- `socket → bind → listen → accept` loop
+- HTTP/1.1 request parser
+- A router: paths to handler functions
+- Static file serving with content-type detection
+- Keep-alive support
+- Concurrent handling — first thread-per-connection, then thread pool, then
+  a hint of `epoll`/`kqueue`
+- Simple logging
+- Configurable timeouts
+- A load test with `wrk`
+
+End result: ~1500 lines of C++, around 50,000 requests/second on a laptop.
+
+## The CHALLENGE — read these now
+
+Before you write a line:
+
+```bash
+man 2 socket
+man 2 bind
+man 2 listen
+man 2 accept
+man 2 read
+man 2 write
+man 2 setsockopt
+man 7 tcp
+```
+
+You don't need to memorize them. Skim. They will make sense after you've
+written the code, and you'll come back to them constantly.
+
+Also: read RFC 7230 (HTTP/1.1 message syntax). 50 pages. Skip parts that
+look like edge cases — we don't need them.
+
+## Mental model — the picture
+
+```
+   client                          server
+     |                                |
+     |--------- SYN ----------------->|
+     |<-------- SYN-ACK --------------|
+     |--------- ACK ----------------->|
+     |                                |
+     |  GET /index.html HTTP/1.1 \r\n |
+     |  Host: localhost \r\n          |
+     |  \r\n                          |
+     |------------------------------->|
+     |                                |  parse, route, handle
+     |                                |
+     |  HTTP/1.1 200 OK \r\n          |
+     |  Content-Length: 13 \r\n       |
+     |  \r\n                          |
+     |  Hello, World!                 |
+     |<-------------------------------|
+     |                                |
+     |--------- FIN ----------------->|   (or keep-alive)
+```
+
+That's it. The next lesson sets up the project and writes the listen loop.

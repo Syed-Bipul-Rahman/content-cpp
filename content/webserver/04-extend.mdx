@@ -1,0 +1,398 @@
+---
+title: Extending — keep-alive, threads, static files, MIME
+description: Make it concurrent, persistent, and able to serve a real website.
+---
+
+# Extending the server
+
+The single-threaded server handles one request at a time. That's enough to
+prove the loop, not enough to use. In this lesson we add: connection
+keep-alive, concurrent connections, static file serving, MIME types, and
+sensible logging.
+
+## Keep-alive
+
+HTTP/1.1 clients reuse the connection by default. Don't close after each
+response — loop and parse the next request from the same socket.
+
+### server.cpp — change `handle`
+
+```cpp
+void Server::handle(int client_fd) {
+    std::string buf;
+    char chunk[4096];
+
+    while (true) {
+        ssize_t n = recv(client_fd, chunk, sizeof(chunk), 0);
+        if (n <= 0) return;
+        buf.append(chunk, chunk + n);
+
+        while (true) {
+            std::optional<Request> req;
+            try { req = try_parse(buf); }
+            catch (const std::exception& e) {
+                Response bad = Response{400, "Bad Request"}.text(std::string{e.what()} + "\n");
+                std::string out = serialize(bad, false);
+                send_all(client_fd, out.data(), out.size());
+                return;
+            }
+            if (!req) break;   // need more bytes — go read
+
+            bool keep = wants_keepalive(*req);
+            Response res;
+            try { res = router_.dispatch(*req); }
+            catch (const std::exception& e) {
+                res  = Response{500, "Internal Server Error"}.text(std::string{e.what()} + "\n");
+                keep = false;
+            }
+            std::string out = serialize(res, keep);
+            if (!send_all(client_fd, out.data(), out.size())) return;
+            if (!keep) return;
+        }
+
+        if (buf.size() > 1 << 20) {
+            Response too_big = Response{413, "Payload Too Large"}.text("too large\n");
+            std::string out = serialize(too_big, false);
+            send_all(client_fd, out.data(), out.size());
+            return;
+        }
+    }
+}
+```
+
+Where `wants_keepalive` is:
+
+```cpp
+namespace {
+bool wants_keepalive(const Request& req) {
+    auto it = req.headers.find("connection");
+    if (it == req.headers.end()) {
+        return req.version == "HTTP/1.1";   // default for 1.1, off for 1.0
+    }
+    std::string v = it->second;
+    for (char& c : v) c = std::tolower(static_cast<unsigned char>(c));
+    if (req.version == "HTTP/1.0") return v == "keep-alive";
+    return v != "close";
+}
+}
+```
+
+Test:
+
+```bash
+curl -v --next http://localhost:8080/ --next http://localhost:8080/
+```
+
+Both requests should reuse the same connection.
+
+## Idle timeout
+
+Don't let a client hold a socket open forever doing nothing. Set a receive
+timeout on the client socket:
+
+```cpp
+#include <sys/socket.h>
+struct timeval tv{ .tv_sec = 30, .tv_usec = 0 };
+setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+```
+
+Now `recv` returns -1 with `errno == EAGAIN` if no bytes arrive in 30s.
+
+## Concurrency, take one — thread per connection
+
+Cheap and simple. Spawn a `std::thread` per accepted socket, detach it.
+
+### server.cpp
+
+```cpp
+#include <thread>
+
+void Server::run() {
+    Socket srv = listen_tcp(port_);
+    std::cout << "listening on " << port_ << '\n';
+
+    while (true) {
+        int cfd = accept(srv.get(), nullptr, nullptr);
+        if (cfd < 0) { std::perror("accept"); continue; }
+        std::thread([this, cfd] {
+            handle(cfd);
+            ::close(cfd);
+        }).detach();
+    }
+}
+```
+
+Done. Survives a few thousand concurrent clients on a modern machine.
+
+## Concurrency, take two — thread pool
+
+Threads-per-connection wastes memory at high concurrency. A pool with a work
+queue is the next step.
+
+### src/pool.hpp
+
+```cpp
+#pragma once
+
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
+namespace hsv {
+
+class ThreadPool {
+public:
+    explicit ThreadPool(std::size_t n);
+    ~ThreadPool();
+
+    void submit(std::function<void()> task);
+
+private:
+    void worker();
+
+    std::vector<std::thread>          workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex                        m_;
+    std::condition_variable           cv_;
+    bool                              stop_ = false;
+};
+
+}
+```
+
+### src/pool.cpp
+
+```cpp
+#include "pool.hpp"
+
+namespace hsv {
+
+ThreadPool::ThreadPool(std::size_t n) {
+    for (std::size_t i = 0; i < n; ++i)
+        workers_.emplace_back([this] { worker(); });
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::lock_guard lock{m_};
+        stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& t : workers_) t.join();
+}
+
+void ThreadPool::submit(std::function<void()> task) {
+    {
+        std::lock_guard lock{m_};
+        tasks_.push(std::move(task));
+    }
+    cv_.notify_one();
+}
+
+void ThreadPool::worker() {
+    while (true) {
+        std::function<void()> task;
+        {
+            std::unique_lock lock{m_};
+            cv_.wait(lock, [&] { return stop_ || !tasks_.empty(); });
+            if (stop_ && tasks_.empty()) return;
+            task = std::move(tasks_.front());
+            tasks_.pop();
+        }
+        try { task(); } catch (const std::exception& e) {
+            std::fprintf(stderr, "task threw: %s\n", e.what());
+        }
+    }
+}
+
+}
+```
+
+### server.cpp — submit instead of spawn
+
+```cpp
+#include "pool.hpp"
+
+void Server::run() {
+    Socket srv = listen_tcp(port_);
+    ThreadPool pool{std::thread::hardware_concurrency()};
+    std::cout << "listening on " << port_ << " (workers " << std::thread::hardware_concurrency() << ")\n";
+
+    while (true) {
+        int cfd = accept(srv.get(), nullptr, nullptr);
+        if (cfd < 0) { std::perror("accept"); continue; }
+        pool.submit([this, cfd] {
+            handle(cfd);
+            ::close(cfd);
+        });
+    }
+}
+```
+
+Don't forget to add `pool.cpp` to CMake.
+
+For real high concurrency you'll want a non-blocking event loop with `epoll`
+(Linux) or `kqueue` (BSD/macOS). That's a worthy bonus project — see the
+exercises.
+
+## Static files
+
+Most of what a web server actually does is serve files. Add a handler that
+maps a URL path to a file under a root directory.
+
+### src/static.hpp
+
+```cpp
+#pragma once
+#include "http.hpp"
+#include <filesystem>
+#include <string>
+
+namespace hsv {
+
+class StaticFiles {
+public:
+    explicit StaticFiles(std::filesystem::path root) : root_{std::move(root)} {}
+    Response handle(const Request& req) const;
+
+private:
+    std::filesystem::path root_;
+};
+
+std::string mime_for(const std::filesystem::path& p);
+
+}
+```
+
+### src/static.cpp
+
+```cpp
+#include "static.hpp"
+
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+
+namespace hsv {
+
+namespace fs = std::filesystem;
+
+std::string mime_for(const fs::path& p) {
+    static const std::unordered_map<std::string, std::string> table{
+        {".html", "text/html; charset=utf-8"},
+        {".htm",  "text/html; charset=utf-8"},
+        {".css",  "text/css; charset=utf-8"},
+        {".js",   "application/javascript; charset=utf-8"},
+        {".json", "application/json; charset=utf-8"},
+        {".txt",  "text/plain; charset=utf-8"},
+        {".md",   "text/markdown; charset=utf-8"},
+        {".png",  "image/png"},
+        {".jpg",  "image/jpeg"},
+        {".jpeg", "image/jpeg"},
+        {".gif",  "image/gif"},
+        {".svg",  "image/svg+xml"},
+        {".ico",  "image/x-icon"},
+        {".pdf",  "application/pdf"},
+        {".wasm", "application/wasm"},
+    };
+    auto it = table.find(p.extension().string());
+    return it == table.end() ? "application/octet-stream" : it->second;
+}
+
+namespace {
+std::string strip_query(std::string_view s) {
+    auto q = s.find('?');
+    return std::string{q == std::string_view::npos ? s : s.substr(0, q)};
+}
+
+bool is_safe(const fs::path& root, const fs::path& target) {
+    auto canon_root   = fs::weakly_canonical(root);
+    auto canon_target = fs::weakly_canonical(target);
+    auto rs = canon_root.string();
+    auto ts = canon_target.string();
+    return ts.starts_with(rs);
+}
+}
+
+Response StaticFiles::handle(const Request& req) const {
+    fs::path rel = strip_query(req.target);
+    if (rel.is_absolute()) rel = rel.lexically_relative("/");
+    fs::path target = root_ / rel;
+
+    if (fs::is_directory(target)) target /= "index.html";
+    if (!is_safe(root_, target))             return Response{403, "Forbidden"}.text("forbidden\n");
+    if (!fs::exists(target))                 return Response{404, "Not Found"}.text("not found\n");
+    if (!fs::is_regular_file(target))        return Response{404, "Not Found"}.text("not found\n");
+
+    std::ifstream f{target, std::ios::binary};
+    if (!f)                                  return Response{500, "Internal Server Error"}.text("read failed\n");
+    std::ostringstream ss; ss << f.rdbuf();
+
+    Response r;
+    r.body = ss.str();
+    r.set("Content-Type", mime_for(target));
+    return r;
+}
+
+}
+```
+
+Wire in:
+
+```cpp
+// main.cpp
+#include "static.hpp"
+
+StaticFiles fs{std::filesystem::path{argv[2]}};   // ./hsv 8080 ./public
+r.get("/static",  [&fs](const Request& req) { return fs.handle(req); });
+// or — catch-all under "/"
+// (Right now our router uses exact path matches; you'll add prefix matching
+// in lesson 5 or as an exercise.)
+```
+
+## Logging
+
+```cpp
+#include <chrono>
+
+namespace hsv {
+void log_request(const Request& req, int status, std::size_t body_size, std::chrono::microseconds dur) {
+    std::fprintf(stderr, "%s %s %d %zu %lldus\n",
+        req.method.c_str(), req.target.c_str(), status, body_size,
+        static_cast<long long>(dur.count()));
+}
+}
+```
+
+Call it after each response in `handle`. Keep the format tight; ship to a
+logging stack later.
+
+## Test under load
+
+Install `wrk`:
+
+```bash
+brew install wrk         # macOS
+sudo apt install wrk     # Debian/Ubuntu
+```
+
+```bash
+wrk -t4 -c100 -d10s http://localhost:8080/
+```
+
+With keep-alive + thread pool you should see tens of thousands of req/s on
+a laptop. If you don't, profile.
+
+## Exercises
+
+1. Add prefix routing: `r.mount("/static/", &StaticFiles::handle, ...)` —
+   anything under `/static/` falls through to the file handler.
+2. Add gzip encoding for text responses (use `<zlib.h>`).
+3. Add `If-Modified-Since` / `Last-Modified` for static files.
+4. Replace the thread pool with an `epoll`-based event loop. Be ready to
+   rethink everything — non-blocking sockets are a different game.
+5. Add a `/healthz` endpoint and a `/metrics` endpoint that prints
+   per-status-code counters.

@@ -1,0 +1,323 @@
+---
+title: Polish, signals, jobs, and shipping
+description: Job control, signal handling, line editing, scripting, and packaging.
+---
+
+# Polish & ship
+
+The shell runs commands. To call it done, we need: signals that don't kill
+us, job control, line editing, the ability to run scripts, and a clean
+release. This lesson takes you the rest of the way.
+
+## Signal handling
+
+Right now, `Ctrl+C` kills the whole shell. We want it to interrupt the
+foreground job, not the shell.
+
+### What the signals mean
+
+| Signal | Trigger | Default action |
+| --- | --- | --- |
+| `SIGINT` | Ctrl+C | terminate |
+| `SIGTSTP` | Ctrl+Z | stop |
+| `SIGQUIT` | Ctrl+\\ | core dump |
+| `SIGCHLD` | child changed state | ignore |
+
+The shell **ignores** the first three (or installs handlers that just print
+a newline). Children **reset them to defaults** before exec.
+
+### src/signals.hpp
+
+```cpp
+#pragma once
+namespace msh {
+void install_shell_signals();
+void reset_signals_for_child();
+}
+```
+
+### src/signals.cpp
+
+```cpp
+#include "signals.hpp"
+#include <signal.h>
+#include <cstdio>
+#include <unistd.h>
+
+namespace msh {
+
+namespace {
+void on_sigint(int) { ::write(STDOUT_FILENO, "\n", 1); }
+}
+
+void install_shell_signals() {
+    struct sigaction sa{};
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, nullptr);
+
+    struct sigaction ign{};
+    ign.sa_handler = SIG_IGN;
+    sigemptyset(&ign.sa_mask);
+    sigaction(SIGQUIT, &ign, nullptr);
+    sigaction(SIGTSTP, &ign, nullptr);
+    sigaction(SIGTTIN, &ign, nullptr);
+    sigaction(SIGTTOU, &ign, nullptr);
+}
+
+void reset_signals_for_child() {
+    struct sigaction sa{};
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGQUIT, &sa, nullptr);
+    sigaction(SIGTSTP, &sa, nullptr);
+    sigaction(SIGTTIN, &sa, nullptr);
+    sigaction(SIGTTOU, &sa, nullptr);
+}
+
+}
+```
+
+In `main.cpp`, call `install_shell_signals()` before `sh.run()`. In
+`executor.cpp`, call `reset_signals_for_child()` immediately after `fork`
+returns 0 in the child.
+
+## Job control
+
+Each pipeline becomes a **job**. Each job has a process group. The terminal
+hands control of itself (the foreground process group) to the job. When the
+job stops or finishes, the shell takes the terminal back.
+
+### src/job.hpp
+
+```cpp
+#pragma once
+#include <string>
+#include <sys/types.h>
+
+namespace msh {
+
+enum class JobState { Running, Stopped, Done };
+
+struct Job {
+    int         id;
+    pid_t       pgid;
+    std::string cmdline;
+    JobState    state;
+};
+
+}
+```
+
+### Inside the executor
+
+Before forking the first stage, decide the process-group leader:
+
+```cpp
+pid_t pgid = 0;   // 0 means "use my own pid as the pgid"
+
+for (... each stage ...) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (pgid == 0) pgid = getpid();
+        setpgid(0, pgid);            // join the group
+        if (!pipe.background) tcsetpgrp(STDIN_FILENO, pgid);  // get terminal
+        reset_signals_for_child();
+        // ... rest of child code ...
+    }
+    // parent
+    if (pgid == 0) pgid = pid;
+    setpgid(pid, pgid);              // race-safe: do it in both
+}
+```
+
+After the loop, in the foreground case, wait for the group:
+
+```cpp
+int status = 0;
+while (true) {
+    pid_t w = waitpid(-pgid, &status, WUNTRACED);
+    if (w < 0) break;
+    if (WIFSTOPPED(status)) {
+        // store as a stopped job, return prompt
+        break;
+    }
+    if (waitpid(-pgid, nullptr, WNOHANG) <= 0) break;
+}
+// take the terminal back
+tcsetpgrp(STDIN_FILENO, getpgrp());
+```
+
+### `jobs`, `fg`, `bg` built-ins
+
+Maintain a `std::vector<Job>` in the `Shell`. After each pipeline, add or
+update entries. Implement built-ins that print/resume/foreground a job by id:
+
+```cpp
+// fg %1 → SIGCONT to job 1, give it the terminal, waitpid for it
+// bg %1 → SIGCONT to job 1, leave it in the background
+// jobs  → list all jobs and their states
+```
+
+The full mechanics fill a chapter in *Advanced Programming in the UNIX
+Environment* (Stevens). Reference that book — what we've sketched here is
+the minimum.
+
+## Reaping background jobs
+
+Install a `SIGCHLD` handler that loops over `waitpid(-1, &status, WNOHANG)`
+and updates job state. Call it from the prompt loop too — the prompt is a
+natural reap point:
+
+```cpp
+void reap_zombies(std::vector<Job>& jobs) {
+    int status;
+    while (true) {
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid <= 0) break;
+        // find the job by pgid, mark Done if no procs remain
+    }
+}
+```
+
+## Line editing with `readline`
+
+You wrote `std::getline`. It's fine. To get arrow keys, history, and
+completion in two lines, link `libreadline`:
+
+```cmake
+find_library(READLINE_LIB readline)
+if(READLINE_LIB)
+    target_link_libraries(msh PRIVATE ${READLINE_LIB})
+    target_compile_definitions(msh PRIVATE HAVE_READLINE)
+endif()
+```
+
+```cpp
+#ifdef HAVE_READLINE
+#include <readline/readline.h>
+#include <readline/history.h>
+#endif
+
+bool Shell::read_line(std::string& out) {
+#ifdef HAVE_READLINE
+    char* p = readline("");
+    if (!p) return false;
+    if (*p) add_history(p);
+    out = p;
+    free(p);
+    return true;
+#else
+    return static_cast<bool>(std::getline(std::cin, out));
+#endif
+}
+```
+
+(Move the prompt printing into the `readline` call, or pass an empty prompt
+and keep your own.)
+
+## Scripting mode
+
+```cpp
+int main(int argc, char** argv) {
+    msh::install_shell_signals();
+    msh::Shell sh;
+    if (argc > 1) {
+        std::ifstream f{argv[1]};
+        if (!f) { std::perror(argv[1]); return 1; }
+        return sh.run(f);
+    }
+    return sh.run(std::cin);
+}
+```
+
+Adapt `Shell::run` to take an `std::istream&`. Swallow lines beginning with
+`#` (comments). Now `./msh script.sh` works.
+
+## Tests
+
+A shell is a great place to use end-to-end tests. Write a Bash (yes, Bash —
+your competitor is your test harness) script that pipes commands into
+`./build/msh` and checks the output:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+assert_eq() {
+    local got="$1" expect="$2" desc="$3"
+    if [[ "$got" != "$expect" ]]; then
+        echo "FAIL: $desc"
+        echo "  got:    $got"
+        echo "  expect: $expect"
+        exit 1
+    fi
+    echo "ok: $desc"
+}
+
+assert_eq "$(echo 'echo hello' | ./build/msh)" 'hello'              'simple echo'
+assert_eq "$(echo 'echo $HOME' | ./build/msh)" "$HOME"              'env expansion'
+assert_eq "$(echo 'echo a b | wc -w' | ./build/msh)" '2'            'pipeline'
+```
+
+Run as part of CI.
+
+## Sanitizers in CI
+
+```yaml
+# .github/workflows/ci.yml
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build
+      - run: ./tests.sh
+```
+
+The Debug profile already enables ASan + UBSan. If your tests trip them,
+the workflow fails. Done.
+
+## Packaging
+
+Static-ish release binary:
+
+```bash
+cmake -S . -B release -DCMAKE_BUILD_TYPE=Release
+cmake --build release
+strip release/msh
+```
+
+For Linux, that single binary plus a license file is your distribution.
+For macOS, sign and notarize if you want to share.
+
+## Final checklist
+
+- [ ] Builds clean with `-Wall -Wextra -Wpedantic`
+- [ ] All sanitizers happy
+- [ ] `tests.sh` passes
+- [ ] `Ctrl+C` interrupts a child but not the shell
+- [ ] `sleep 10 &` returns immediately and reaps cleanly
+- [ ] `cd`, `pwd`, `exit`, `export`, `unset` work
+- [ ] Pipes, `<`, `>`, `>>` work
+- [ ] Quotes and `$VAR` work
+- [ ] Scripting mode works
+- [ ] Project builds with one `cmake --build build` from a fresh clone
+
+## What you've built
+
+About 1500 lines of C++. A real shell that handles 90% of what people
+actually type into a terminal. You wrote every byte of it on top of `fork`,
+`exec`, `pipe`, `dup2`, `wait`, and a few signal calls. There is no magic
+in `bash`. You have just proven it.
+
+## Where next
+
+The next track up: [build your own text editor](/projects/text-editor) — same
+flavor of project, very different shape. Or jump to
+[the operating system track](/projects/os) — it's a shell with no kernel
+underneath.

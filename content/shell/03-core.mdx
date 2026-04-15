@@ -1,0 +1,294 @@
+---
+title: Core mechanic — minimum viable shell
+description: Tokenize, fork, exec, wait. A shell that runs real commands.
+---
+
+# Core: a minimum viable shell
+
+By the end of this lesson `msh` runs commands. `ls`, `cat`, `pwd`, `gcc` —
+anything in your `$PATH`. The pieces are tokenization, fork, exec, wait.
+
+## Tokenizing the line
+
+The simplest tokenizer splits on whitespace. We'll handle quotes in lesson 4.
+
+### src/lexer.hpp
+
+```cpp
+#pragma once
+#include <string>
+#include <vector>
+
+namespace msh {
+
+std::vector<std::string> tokenize(std::string_view line);
+
+}
+```
+
+### src/lexer.cpp
+
+```cpp
+#include "lexer.hpp"
+#include <cctype>
+
+namespace msh {
+
+std::vector<std::string> tokenize(std::string_view line) {
+    std::vector<std::string> tokens;
+    std::string current;
+
+    for (char c : line) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!current.empty()) { tokens.push_back(std::move(current)); current.clear(); }
+        } else {
+            current.push_back(c);
+        }
+    }
+    if (!current.empty()) tokens.push_back(std::move(current));
+    return tokens;
+}
+
+}
+```
+
+Add `src/lexer.cpp` to your `add_executable(...)` in CMake.
+
+## A command type
+
+### src/parser.hpp
+
+```cpp
+#pragma once
+#include <string>
+#include <vector>
+
+namespace msh {
+
+struct Command {
+    std::vector<std::string> argv;          // ["ls", "-l"]
+    bool background = false;                 // we'll use this in lesson 5
+};
+
+Command parse(std::vector<std::string> tokens);
+
+}
+```
+
+### src/parser.cpp
+
+```cpp
+#include "parser.hpp"
+
+namespace msh {
+
+Command parse(std::vector<std::string> tokens) {
+    Command c;
+    if (!tokens.empty() && tokens.back() == "&") {
+        c.background = true;
+        tokens.pop_back();
+    }
+    c.argv = std::move(tokens);
+    return c;
+}
+
+}
+```
+
+For now, "parsing" is barely more than tokenizing. We'll grow it.
+
+## The executor
+
+### src/executor.hpp
+
+```cpp
+#pragma once
+#include "parser.hpp"
+
+namespace msh {
+
+int execute(const Command& cmd);
+
+}
+```
+
+### src/executor.cpp
+
+```cpp
+#include "executor.hpp"
+
+#include <iostream>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace msh {
+
+int execute(const Command& cmd) {
+    if (cmd.argv.empty()) return 0;
+
+    // build a C-style argv for execvp
+    std::vector<char*> c_argv;
+    c_argv.reserve(cmd.argv.size() + 1);
+    for (const auto& a : cmd.argv) {
+        c_argv.push_back(const_cast<char*>(a.c_str()));
+    }
+    c_argv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::perror("fork");
+        return 1;
+    }
+    if (pid == 0) {
+        execvp(c_argv[0], c_argv.data());
+        // only here on failure
+        std::cerr << "msh: " << c_argv[0] << ": command not found\n";
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        std::perror("waitpid");
+        return 1;
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 1;
+}
+
+}
+```
+
+Note `_exit` (not `exit`) on the failure path inside the child — it skips
+atexit handlers and stream flushes that would step on the parent's state
+since `fork` duplicates buffers.
+
+## Wire it into the shell
+
+### src/shell.cpp (replace `execute`)
+
+```cpp
+#include "lexer.hpp"
+#include "parser.hpp"
+#include "executor.hpp"
+
+// ...
+
+int Shell::execute(const std::string& line) {
+    auto tokens = tokenize(line);
+    if (tokens.empty()) return 0;
+    Command cmd = parse(std::move(tokens));
+    return msh::execute(cmd);
+}
+```
+
+Add the new files to CMake:
+
+```cmake
+add_executable(msh
+    src/main.cpp
+    src/shell.cpp
+    src/lexer.cpp
+    src/parser.cpp
+    src/executor.cpp
+)
+```
+
+## Try it
+
+```bash
+cmake --build build
+./build/msh
+msh:/.../msh$ ls
+build  CMakeLists.txt  src
+msh:/.../msh$ echo hello world
+hello world
+msh:/.../msh$ uname -a
+Darwin ...
+msh:/.../msh$
+```
+
+Congratulations. You have a working shell.
+
+## Built-ins — `cd` and `exit`
+
+Some commands **must** run in the shell process itself. `cd` is the canonical
+example: if you `fork` and run `cd /tmp` in the child, the child's working
+directory changes — and then it dies. The parent (your shell) sees nothing.
+
+We handle these before the fork:
+
+### src/executor.cpp (additions)
+
+```cpp
+namespace {
+
+bool is_builtin(const std::string& name) {
+    return name == "cd" || name == "exit" || name == "pwd";
+}
+
+int run_builtin(const Command& cmd) {
+    const auto& argv = cmd.argv;
+    if (argv[0] == "exit") {
+        int code = 0;
+        if (argv.size() > 1) code = std::atoi(argv[1].c_str());
+        std::exit(code);   // leave the whole shell
+    }
+    if (argv[0] == "cd") {
+        const char* target = argv.size() > 1 ? argv[1].c_str() : std::getenv("HOME");
+        if (!target) target = "/";
+        if (chdir(target) != 0) { std::perror("cd"); return 1; }
+        return 0;
+    }
+    if (argv[0] == "pwd") {
+        char buf[PATH_MAX];
+        if (!getcwd(buf, sizeof(buf))) { std::perror("pwd"); return 1; }
+        std::cout << buf << '\n';
+        return 0;
+    }
+    return 1;
+}
+
+}  // anon namespace
+
+int execute(const Command& cmd) {
+    if (cmd.argv.empty()) return 0;
+    if (is_builtin(cmd.argv[0])) return run_builtin(cmd);
+    // ... existing fork/exec code ...
+}
+```
+
+Add `<climits>`, `<cstdlib>`.
+
+## A quick test
+
+```bash
+./build/msh
+msh:/...$ pwd
+/path/to/msh
+msh:/...$ cd /tmp
+msh:/tmp$ pwd
+/tmp
+msh:/tmp$ exit
+```
+
+## What's still missing
+
+- Pipes: `ls | grep cpp`
+- Redirection: `echo hi > out.txt`
+- Quoted arguments: `echo "hello world"`
+- Environment variable expansion: `echo $HOME`
+- Background jobs: `sleep 5 &`
+- Signal handling: `Ctrl+C` shouldn't kill the shell
+
+We tackle them next.
+
+## Exercises
+
+1. Add an `echo` built-in. Why might you want a shell-builtin echo when
+   `/bin/echo` exists?
+2. Make `cd -` change to the previous directory (track it in the `Shell`
+   class).
+3. Add a `which` built-in that searches `$PATH` for a binary and prints its
+   absolute path.
+4. Make the prompt show `?` and the previous exit code in red when nonzero.

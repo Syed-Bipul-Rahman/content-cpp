@@ -1,0 +1,309 @@
+---
+title: Ship — config, errors, tests, deployment
+description: From a working server to one you'd let strangers connect to.
+---
+
+# Polish & ship
+
+You have a working HTTP/1.1 server with concurrency, keep-alive, and static
+files. This lesson takes it from "works on my machine" to "I'd let it run
+behind Nginx on a real host". Config, hardening, tests, distribution.
+
+## Configuration
+
+A real server takes options, not hard-coded constants.
+
+### src/config.hpp
+
+```cpp
+#pragma once
+#include <cstdint>
+#include <filesystem>
+#include <string>
+
+namespace hsv {
+
+struct Config {
+    uint16_t              port            = 8080;
+    std::string           bind_addr       = "0.0.0.0";
+    std::filesystem::path static_root     = "./public";
+    std::size_t           workers         = 0;       // 0 = hardware_concurrency
+    std::size_t           max_request     = 1 << 20; // 1 MiB
+    int                   keepalive_secs  = 30;
+    bool                  log_requests    = true;
+};
+
+Config parse_args(int argc, char** argv);
+
+}
+```
+
+### src/config.cpp
+
+```cpp
+#include "config.hpp"
+
+#include <cstdlib>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+namespace hsv {
+
+namespace {
+[[noreturn]] void usage() {
+    std::cerr <<
+        "usage: hsv [options]\n"
+        "  --port N           (default 8080)\n"
+        "  --bind ADDR        (default 0.0.0.0)\n"
+        "  --static DIR       (default ./public)\n"
+        "  --workers N        (default = cores)\n"
+        "  --max-request N    (default 1048576)\n"
+        "  --keepalive SECS   (default 30)\n"
+        "  --quiet            disable per-request logs\n";
+    std::exit(2);
+}
+}
+
+Config parse_args(int argc, char** argv) {
+    Config c;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc) usage();
+            return argv[++i];
+        };
+        if      (a == "--port")        c.port           = static_cast<uint16_t>(std::stoi(next()));
+        else if (a == "--bind")        c.bind_addr      = next();
+        else if (a == "--static")      c.static_root    = next();
+        else if (a == "--workers")     c.workers        = std::stoul(next());
+        else if (a == "--max-request") c.max_request    = std::stoul(next());
+        else if (a == "--keepalive")   c.keepalive_secs = std::stoi(next());
+        else if (a == "--quiet")       c.log_requests   = false;
+        else if (a == "--help" || a == "-h") usage();
+        else { std::cerr << "unknown option: " << a << '\n'; usage(); }
+    }
+    return c;
+}
+
+}
+```
+
+Plumb `Config` through `Server` and remove the magic numbers.
+
+## Graceful shutdown
+
+Right now `Ctrl+C` kills the process mid-response. Install a signal handler
+that flips a flag the accept loop checks.
+
+```cpp
+#include <atomic>
+#include <signal.h>
+
+namespace hsv {
+std::atomic<bool> g_stop{false};
+void on_signal(int) { g_stop = true; }
+}
+
+// in main, before s.run():
+struct sigaction sa{};
+sa.sa_handler = hsv::on_signal;
+sigaction(SIGINT,  &sa, nullptr);
+sigaction(SIGTERM, &sa, nullptr);
+
+// in Server::run, after accept:
+if (g_stop) break;
+
+// also: ignore SIGPIPE so writing to a closed socket returns EPIPE instead of dying
+signal(SIGPIPE, SIG_IGN);
+```
+
+After the loop exits, the destructors clean up — sockets close, threads
+join.
+
+## Error handling — one place
+
+Wrap your handler dispatch with a single try/catch in `Server::handle`. Any
+exception turns into a `500`. We did this in lesson 3; review it now and make
+sure no path is missed.
+
+For known errors, throw a typed `HttpError`:
+
+```cpp
+namespace hsv {
+struct HttpError : std::runtime_error {
+    int status; std::string reason;
+    HttpError(int s, std::string r, std::string what)
+        : std::runtime_error{std::move(what)}, status{s}, reason{std::move(r)} {}
+};
+}
+```
+
+Then in handlers:
+
+```cpp
+if (!user_authorized) throw HttpError{401, "Unauthorized", "login required\n"};
+```
+
+In `handle`:
+
+```cpp
+catch (const HttpError& e) {
+    res = Response{e.status, e.reason}.text(e.what());
+    keep = false;
+}
+```
+
+## Hardening checklist
+
+- [x] **`SIGPIPE` ignored.** Writing to a closed socket returns `EPIPE`,
+      which we already check. Without this, the server dies.
+- [x] **Request size cap.** We reject anything over 1 MiB by default.
+- [x] **Receive timeouts.** A slow-loris client can't hold connections
+      forever.
+- [x] **Path traversal blocked.** `is_safe()` in `static.cpp` resolves the
+      path and confirms it stays under the root.
+- [x] **No format-string-injection.** We use streams and `Content-Length`,
+      never `printf` of user data.
+- [ ] **Limit concurrent connections.** Add a counter or a `Semaphore`
+      gate on accept; refuse with 503 above the cap.
+- [ ] **Drop privileges.** If you bind a privileged port (80, 443) as root,
+      `setuid` to a less-privileged user immediately after.
+- [ ] **`chroot`.** For static-only serving, `chroot` into the static root.
+
+## Tests
+
+End-to-end tests with `curl` are easy and convincing. Capture HTTP-level
+behavior, not implementation details.
+
+### tests/run.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT=18080
+ROOT=$(mktemp -d)
+echo '<h1>hi</h1>' > "$ROOT/index.html"
+echo 'plain'       > "$ROOT/a.txt"
+
+./build/hsv --port $PORT --static "$ROOT" --quiet &
+PID=$!
+trap "kill $PID 2>/dev/null || true; rm -rf $ROOT" EXIT
+sleep 0.2
+
+assert() { local desc="$1"; shift; if ! "$@"; then echo "FAIL: $desc"; exit 1; fi; echo "ok: $desc"; }
+
+assert "GET / 200"  bash -c "curl -fs http://localhost:$PORT/ | grep -q hi"
+assert "GET /a.txt" bash -c "curl -fs http://localhost:$PORT/a.txt | grep -q plain"
+assert "GET 404"    bash -c "test \"\$(curl -s -o /dev/null -w %{http_code} http://localhost:$PORT/missing)\" = 404"
+assert "POST echo"  bash -c "test \"\$(curl -s -X POST -d ping http://localhost:$PORT/echo)\" = ping"
+assert "405"        bash -c "test \"\$(curl -s -o /dev/null -w %{http_code} -X PUT http://localhost:$PORT/)\" = 405"
+```
+
+Add a unit test for the parser using Catch2 — it's the part most likely to
+hide a bug, and it's pure logic so it tests easily.
+
+## Benchmark
+
+```bash
+./build/hsv --port 8080 --static ./public --quiet &
+wrk -t4 -c200 -d30s http://localhost:8080/
+```
+
+Look at requests/sec and the latency tail. Note them in the README. You
+shipped a number now — that means something.
+
+## Dockerize (optional)
+
+```dockerfile
+FROM debian:stable-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ cmake make
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+
+FROM debian:stable-slim
+COPY --from=build /src/build/hsv /usr/local/bin/hsv
+COPY public /var/www
+EXPOSE 8080
+USER 65534
+CMD ["hsv", "--port", "8080", "--static", "/var/www"]
+```
+
+```bash
+docker build -t hsv .
+docker run --rm -p 8080:8080 hsv
+```
+
+## CI
+
+```yaml
+# .github/workflows/ci.yml
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j
+      - name: Test
+        run: ./tests/run.sh
+```
+
+The Debug profile already has ASan + UBSan on. If your tests trip a sanitizer
+the workflow fails. That's the point.
+
+## Behind Nginx (production-ish)
+
+For a real deployment, terminate TLS at Nginx and let it proxy to `hsv`:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name example.com;
+    ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+That's the canonical deployment for any C++ web service. Nginx handles TLS,
+HTTP/2, and request smuggling defenses. Your code does the work.
+
+## Final checklist
+
+- [ ] `--help` prints usage
+- [ ] Builds clean with `-Wall -Wextra -Wpedantic`
+- [ ] All sanitizers happy under `tests/run.sh`
+- [ ] Survives `wrk -t8 -c500 -d60s` without leaking
+- [ ] Handles `Ctrl+C` gracefully
+- [ ] Static file serving works, with 404 / 403 / 200 in the right places
+- [ ] Path traversal blocked
+- [ ] `Connection: close` and `Connection: keep-alive` both work
+- [ ] Project README explains build, run, options, benchmark numbers
+
+## What you've built
+
+About 1500–2000 lines of C++. A real HTTP/1.1 server. Concurrent. Static
+files. Keep-alive. Routable. Sanitized in tests. Deployable behind Nginx.
+
+When you next read the Nginx source, the picture will be familiar — same
+loop, more polish.
+
+## Where next
+
+- [Build Your Own Redis](/projects/redis) — same socket dance, different
+  protocol, single-threaded event loop.
+- [Build Your Own Search Engine](/projects/search-engine) — feed the
+  webserver an inverted index and serve queries.
+- [Build Your Own Discord Bot](/projects/discord-bot) — go the other
+  direction: a *client* of HTTPS and WebSockets.

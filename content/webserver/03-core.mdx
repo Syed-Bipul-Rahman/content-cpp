@@ -1,0 +1,413 @@
+---
+title: Core — parse, route, respond
+description: A real HTTP/1.1 request parser, a router, and structured responses.
+---
+
+# Parse, route, respond
+
+Time to read what the client actually sent. We'll write a small HTTP/1.1
+parser, a router that dispatches by path, and structured request/response
+types.
+
+## Request and Response types
+
+### src/http.hpp
+
+```cpp
+#pragma once
+
+#include <string>
+#include <unordered_map>
+
+namespace hsv {
+
+struct Request {
+    std::string method;
+    std::string target;          // "/index.html?x=1"
+    std::string version;         // "HTTP/1.1"
+    std::unordered_map<std::string, std::string> headers;
+    std::string body;
+};
+
+struct Response {
+    int status = 200;
+    std::string reason = "OK";
+    std::unordered_map<std::string, std::string> headers;
+    std::string body;
+
+    Response& set(std::string k, std::string v) {
+        headers.emplace(std::move(k), std::move(v));
+        return *this;
+    }
+    Response& text(std::string b)  { set("Content-Type", "text/plain; charset=utf-8"); body = std::move(b); return *this; }
+    Response& html(std::string b)  { set("Content-Type", "text/html; charset=utf-8");  body = std::move(b); return *this; }
+};
+
+std::string serialize(const Response& r, bool keep_alive);
+
+}
+```
+
+### src/http.cpp
+
+```cpp
+#include "http.hpp"
+#include <sstream>
+
+namespace hsv {
+
+std::string serialize(const Response& r, bool keep_alive) {
+    std::ostringstream out;
+    out << "HTTP/1.1 " << r.status << ' ' << r.reason << "\r\n";
+    out << "Content-Length: " << r.body.size() << "\r\n";
+    out << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n";
+    for (const auto& [k, v] : r.headers) {
+        if (k == "Content-Length" || k == "Connection") continue;
+        out << k << ": " << v << "\r\n";
+    }
+    out << "\r\n";
+    out << r.body;
+    return out.str();
+}
+
+}
+```
+
+## A tiny parser
+
+Real HTTP parsing has edge cases. We'll handle the common path; the exotic
+parts can come later (chunked transfer, trailers, multiple `Content-Length`
+headers, etc.).
+
+### src/parser.hpp
+
+```cpp
+#pragma once
+#include "http.hpp"
+#include <optional>
+#include <string>
+
+namespace hsv {
+
+// Returns nullopt if the bytes don't yet contain a full request.
+// Throws std::runtime_error on a malformed request.
+// On success, removes the consumed bytes from `buf`.
+std::optional<Request> try_parse(std::string& buf);
+
+}
+```
+
+### src/parser.cpp
+
+```cpp
+#include "parser.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <stdexcept>
+
+namespace hsv {
+
+namespace {
+
+std::string trim(std::string s) {
+    auto issp = [](unsigned char c) { return std::isspace(c); };
+    while (!s.empty() && issp(s.front())) s.erase(s.begin());
+    while (!s.empty() && issp(s.back()))  s.pop_back();
+    return s;
+}
+
+std::string lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+}  // anon
+
+std::optional<Request> try_parse(std::string& buf) {
+    auto header_end = buf.find("\r\n\r\n");
+    if (header_end == std::string::npos) return std::nullopt;
+
+    Request req;
+
+    // request line
+    auto line_end = buf.find("\r\n");
+    auto line = std::string_view{buf}.substr(0, line_end);
+
+    auto sp1 = line.find(' ');
+    auto sp2 = line.find(' ', sp1 + 1);
+    if (sp1 == std::string_view::npos || sp2 == std::string_view::npos)
+        throw std::runtime_error("bad request line");
+
+    req.method  = std::string{line.substr(0, sp1)};
+    req.target  = std::string{line.substr(sp1 + 1, sp2 - sp1 - 1)};
+    req.version = std::string{line.substr(sp2 + 1)};
+
+    // headers
+    std::size_t pos = line_end + 2;
+    while (pos < header_end) {
+        auto eol = buf.find("\r\n", pos);
+        if (eol == std::string::npos || eol > header_end) break;
+        auto colon = buf.find(':', pos);
+        if (colon == std::string::npos || colon > eol) {
+            throw std::runtime_error("bad header line");
+        }
+        std::string name  = lower(trim(buf.substr(pos, colon - pos)));
+        std::string value = trim(buf.substr(colon + 1, eol - colon - 1));
+        req.headers.emplace(std::move(name), std::move(value));
+        pos = eol + 2;
+    }
+
+    // body — only if Content-Length is present
+    std::size_t content_len = 0;
+    if (auto it = req.headers.find("content-length"); it != req.headers.end()) {
+        content_len = static_cast<std::size_t>(std::stoul(it->second));
+    }
+
+    std::size_t total_needed = header_end + 4 + content_len;
+    if (buf.size() < total_needed) return std::nullopt;     // body not all here yet
+
+    req.body = buf.substr(header_end + 4, content_len);
+    buf.erase(0, total_needed);
+    return req;
+}
+
+}
+```
+
+## A router
+
+### src/router.hpp
+
+```cpp
+#pragma once
+#include "http.hpp"
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace hsv {
+
+using Handler = std::function<Response(const Request&)>;
+
+class Router {
+public:
+    void get(std::string path, Handler h)  { add("GET",  std::move(path), std::move(h)); }
+    void post(std::string path, Handler h) { add("POST", std::move(path), std::move(h)); }
+
+    Response dispatch(const Request& req) const;
+
+private:
+    struct Route { std::string method; std::string path; Handler handler; };
+    std::vector<Route> routes_;
+
+    void add(std::string m, std::string p, Handler h) {
+        routes_.push_back({std::move(m), std::move(p), std::move(h)});
+    }
+};
+
+}
+```
+
+### src/router.cpp
+
+```cpp
+#include "router.hpp"
+
+namespace hsv {
+
+namespace {
+
+std::string strip_query(std::string_view target) {
+    auto q = target.find('?');
+    return std::string{q == std::string_view::npos ? target : target.substr(0, q)};
+}
+
+Response not_found() {
+    return Response{}.text("not found").set("X-NF", "1").operator=({}), Response{404, "Not Found"}.text("not found\n");
+}
+
+Response method_not_allowed() {
+    return Response{405, "Method Not Allowed"}.text("method not allowed\n");
+}
+
+}  // anon
+
+Response Router::dispatch(const Request& req) const {
+    std::string path = strip_query(req.target);
+    bool path_matched = false;
+    for (const auto& r : routes_) {
+        if (r.path != path) continue;
+        path_matched = true;
+        if (r.method == req.method) return r.handler(req);
+    }
+    if (path_matched) return method_not_allowed();
+    return Response{404, "Not Found"}.text("not found\n");
+}
+
+}
+```
+
+## Wire it into the server
+
+### src/server.hpp (replace)
+
+```cpp
+#pragma once
+#include "router.hpp"
+#include <cstdint>
+
+namespace hsv {
+
+class Server {
+public:
+    Server(uint16_t port, Router router) : port_{port}, router_{std::move(router)} {}
+    void run();
+
+private:
+    void handle(int client_fd);
+
+    uint16_t port_;
+    Router   router_;
+};
+
+}
+```
+
+### src/server.cpp (replace)
+
+```cpp
+#include "server.hpp"
+#include "parser.hpp"
+#include "socket.hpp"
+
+#include <iostream>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace hsv {
+
+void Server::run() {
+    Socket srv = listen_tcp(port_);
+    std::cout << "listening on " << port_ << '\n';
+
+    while (true) {
+        int cfd = accept(srv.get(), nullptr, nullptr);
+        if (cfd < 0) { std::perror("accept"); continue; }
+        handle(cfd);
+        ::close(cfd);
+    }
+}
+
+void Server::handle(int client_fd) {
+    std::string buf;
+    char chunk[4096];
+
+    while (true) {
+        ssize_t n = recv(client_fd, chunk, sizeof(chunk), 0);
+        if (n <= 0) return;
+        buf.append(chunk, chunk + n);
+
+        try {
+            if (auto req = try_parse(buf)) {
+                Response res;
+                try { res = router_.dispatch(*req); }
+                catch (const std::exception& e) {
+                    res = Response{500, "Internal Server Error"}.text(std::string{e.what()} + "\n");
+                }
+                std::string out = serialize(res, /*keep_alive=*/false);
+                send_all(client_fd, out.data(), out.size());
+                return;
+            }
+        } catch (const std::exception& e) {
+            Response bad = Response{400, "Bad Request"}.text(std::string{e.what()} + "\n");
+            std::string out = serialize(bad, false);
+            send_all(client_fd, out.data(), out.size());
+            return;
+        }
+
+        if (buf.size() > 1 << 20) {        // 1 MiB cap
+            Response too_big = Response{413, "Payload Too Large"}.text("too large\n");
+            std::string out = serialize(too_big, false);
+            send_all(client_fd, out.data(), out.size());
+            return;
+        }
+    }
+}
+
+}
+```
+
+## Use it
+
+### src/main.cpp
+
+```cpp
+#include "server.hpp"
+
+#include <iostream>
+
+int main(int argc, char** argv) {
+    using namespace hsv;
+    Router r;
+
+    r.get("/", [](const Request&) {
+        return Response{}.html("<h1>hello</h1><p>welcome to hsv</p>");
+    });
+
+    r.get("/echo", [](const Request& req) {
+        std::string s;
+        s += "method:  " + req.method + '\n';
+        s += "target:  " + req.target + '\n';
+        s += "version: " + req.version + '\n';
+        for (const auto& [k, v] : req.headers) s += k + ": " + v + '\n';
+        return Response{}.text(std::move(s));
+    });
+
+    r.post("/echo", [](const Request& req) {
+        return Response{}.text(req.body);
+    });
+
+    uint16_t port = (argc > 1) ? static_cast<uint16_t>(std::atoi(argv[1])) : 8080;
+    Server{port, std::move(r)}.run();
+    return 0;
+}
+```
+
+Add `parser.cpp`, `router.cpp`, `http.cpp` to CMake.
+
+## Try it
+
+```bash
+cmake --build build
+./build/hsv
+
+# in another terminal:
+curl http://localhost:8080/                        # → <h1>hello</h1>
+curl http://localhost:8080/echo                    # → method/target/headers
+curl http://localhost:8080/missing                 # → 404
+curl -X POST -d 'ping' http://localhost:8080/echo  # → ping
+curl -X PUT  http://localhost:8080/                # → 405
+```
+
+You have an actual web server.
+
+## Common bugs at this stage
+
+1. **Headers compared case-sensitively.** HTTP header names are
+   case-insensitive. We lowercase them. Don't forget.
+2. **Reading until EOF.** Don't. The client won't close — it's waiting for
+   your response. Stop reading when the parser returns a request.
+3. **Forgetting `Content-Length` on responses.** Without it, the client
+   doesn't know when your body ends and either hangs or treats the
+   connection as closed-on-EOF.
+4. **Newlines.** HTTP wants `\r\n`, not `\n`. The compiler won't catch this.
+
+## Exercises
+
+1. Add a `:param` syntax to the router: `r.get("/users/:id", ...)` should
+   match `/users/42` and pass `id=42` somewhere accessible.
+2. Add support for query strings: parse `?a=1&b=2` into a map.
+3. Add a `200`/`201`/`204` helper on `Response`.
+4. Reject requests whose method isn't one of GET/POST/PUT/DELETE/HEAD/OPTIONS
+   with a `501 Not Implemented`.

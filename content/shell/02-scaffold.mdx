@@ -1,0 +1,235 @@
+---
+title: Project scaffold & build setup
+description: Lay out the directory, set up CMake, and stand up a no-op REPL.
+---
+
+# Project scaffold
+
+Time to write code. We'll create the project, set up CMake, and write a
+read-eval-print loop that does nothing useful — but compiles, runs, and
+quits cleanly. Every lesson from here on adds one capability.
+
+## Directory layout
+
+```
+msh/
+├── CMakeLists.txt
+├── README.md
+└── src/
+    ├── main.cpp
+    ├── shell.hpp
+    ├── shell.cpp
+    ├── lexer.hpp
+    ├── lexer.cpp
+    ├── parser.hpp
+    ├── parser.cpp
+    ├── executor.hpp
+    └── executor.cpp
+```
+
+We'll fill these in over the course of the track. For now, just `main.cpp`
+and `shell.{hpp,cpp}`.
+
+```bash
+mkdir -p msh/src && cd msh
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(msh CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+add_executable(msh
+    src/main.cpp
+    src/shell.cpp
+)
+
+target_include_directories(msh PRIVATE src)
+```
+
+## src/shell.hpp
+
+```cpp
+#pragma once
+
+#include <string>
+
+namespace msh {
+
+class Shell {
+public:
+    int run();
+
+private:
+    void print_prompt() const;
+    bool read_line(std::string& out);
+    int  execute(const std::string& line);
+};
+
+}  // namespace msh
+```
+
+## src/shell.cpp
+
+```cpp
+#include "shell.hpp"
+
+#include <iostream>
+#include <unistd.h>
+
+namespace msh {
+
+int Shell::run() {
+    std::string line;
+    int last_status = 0;
+    while (true) {
+        print_prompt();
+        if (!read_line(line)) break;       // EOF (Ctrl+D)
+        if (line.empty()) continue;
+        last_status = execute(line);
+    }
+    std::cout << '\n';
+    return last_status;
+}
+
+void Shell::print_prompt() const {
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd))) {
+        std::cout << "msh:" << cwd << "$ " << std::flush;
+    } else {
+        std::cout << "msh$ " << std::flush;
+    }
+}
+
+bool Shell::read_line(std::string& out) {
+    return static_cast<bool>(std::getline(std::cin, out));
+}
+
+int Shell::execute(const std::string& line) {
+    std::cout << "you typed: " << line << '\n';
+    return 0;
+}
+
+}  // namespace msh
+```
+
+## src/main.cpp
+
+```cpp
+#include "shell.hpp"
+
+int main() {
+    msh::Shell sh;
+    return sh.run();
+}
+```
+
+## Build and run
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/msh
+```
+
+You should see:
+
+```
+msh:/path/to/msh$ hello
+you typed: hello
+msh:/path/to/msh$
+```
+
+Press **Ctrl+D** to exit.
+
+## What we just got for free
+
+- A REPL.
+- A printable, accurate prompt.
+- Clean EOF handling.
+- Sanitizer-instrumented debug build.
+- A tidy namespace and header layout.
+
+## Add a `.gitignore`
+
+```gitignore
+build/
+.cache/
+compile_commands.json
+```
+
+Initialize git, commit. From here on, commit after each lesson.
+
+```bash
+git init
+git add .
+git commit -m "scaffold: REPL skeleton"
+```
+
+## Verify it actually does nothing dangerous
+
+Run it under the sanitizers (already on in debug):
+
+```bash
+./build/msh
+hello
+^D
+```
+
+No leak report. Clean.
+
+## A nicer prompt
+
+The `cwd` prompt gets long. Compress `$HOME` to `~`:
+
+```cpp
+void Shell::print_prompt() const {
+    char cwd[PATH_MAX];
+    if (!getcwd(cwd, sizeof(cwd))) { std::cout << "msh$ "; std::cout.flush(); return; }
+    std::string display{cwd};
+    if (const char* home = std::getenv("HOME")) {
+        std::string h{home};
+        if (display.starts_with(h)) display.replace(0, h.size(), "~");
+    }
+    std::cout << "msh:" << display << "$ " << std::flush;
+}
+```
+
+Add `<climits>` and `<cstdlib>` to the includes.
+
+## Status reporting in the prompt
+
+A common shell convention: show the previous exit code if it's non-zero.
+
+```cpp
+// in run(), pass last_status into print_prompt
+void Shell::print_prompt(int last_status) const {
+    // ... existing code, then:
+    if (last_status != 0) std::cout << "[" << last_status << "] ";
+    std::cout << "msh:" << display << "$ " << std::flush;
+}
+```
+
+## Where we're going
+
+Right now, `execute()` echoes. In the next lesson we'll replace it with a
+real one: tokenize the line, fork, exec, wait. After that — pipes,
+redirection, built-ins, and job control.
+
+Commit your scaffold and move on.

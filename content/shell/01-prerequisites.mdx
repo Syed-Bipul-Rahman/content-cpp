@@ -1,0 +1,181 @@
+---
+title: Prerequisites & mental model
+description: The three syscalls that make a shell. fork, exec, wait — what they do and why.
+---
+
+# Prerequisites & mental model
+
+Before we write code, get the mental model right. A shell is built on three
+POSIX syscalls. If you understand `fork`, `execvp`, and `waitpid`, the rest
+is parsing.
+
+## What you should already know
+
+- C++ Fundamentals through lesson 20 — especially pointers, RAII, and
+  filesystem/I/O.
+- Comfort opening a terminal and reading `man` pages.
+- A POSIX system. macOS or Linux. Windows works only inside WSL.
+
+If `man 2 fork` doesn't open something, install dev tools:
+
+```bash
+# Debian/Ubuntu
+sudo apt install build-essential manpages-dev
+# macOS
+xcode-select --install
+```
+
+## What a process is
+
+A **process** is a running program. It has:
+
+- A unique process ID (PID).
+- A virtual address space (memory).
+- Open file descriptors (0 = stdin, 1 = stdout, 2 = stderr by default).
+- A current working directory, environment variables, signal handlers.
+- A parent process.
+
+## `fork()` — make a copy
+
+```c
+pid_t fork(void);
+```
+
+`fork` duplicates the calling process. After it returns, **two** processes
+exist:
+
+- In the **parent**: returns the child's PID.
+- In the **child**: returns 0.
+- On error: returns -1.
+
+```cpp
+pid_t pid = fork();
+if (pid < 0) {
+    perror("fork");
+} else if (pid == 0) {
+    // child — runs in its own copy
+    std::cout << "I am the child\n";
+} else {
+    // parent
+    std::cout << "I am parent of " << pid << '\n';
+}
+```
+
+The child inherits everything from the parent: open files, environment,
+working directory. They diverge after `fork`.
+
+## `exec*()` — replace yourself
+
+```c
+int execvp(const char* file, char* const argv[]);
+```
+
+`exec` replaces the current process image with a new program. The PID stays.
+File descriptors stay open (unless `FD_CLOEXEC`). Memory is wiped. **It does
+not return on success** — there's nothing to return to; the old code is gone.
+
+```cpp
+char* args[] = {const_cast<char*>("ls"), const_cast<char*>("-l"), nullptr};
+execvp("ls", args);
+perror("execvp");   // only reached if exec failed
+_exit(1);
+```
+
+`execvp` searches `$PATH` for the binary. There are seven `exec` flavors
+(`execl`, `execv`, `execle`, `execve`, `execlp`, `execvp`, `execvpe`) — they
+differ in how they pass arguments and environment. We'll mostly use
+`execvp`.
+
+## `wait()` / `waitpid()` — collect the corpse
+
+When a child exits, the kernel keeps a tiny record (the "zombie") until the
+parent calls `wait` to read its exit status. If you forget, you leak zombies.
+
+```cpp
+int status;
+pid_t done = waitpid(pid, &status, 0);   // 0 = block
+if (WIFEXITED(status)) {
+    int code = WEXITSTATUS(status);
+    std::cout << "child exited with " << code << '\n';
+}
+```
+
+`WNOHANG` makes it return immediately if the child hasn't finished — useful
+for background jobs.
+
+## Putting it together: run a single command
+
+```cpp
+#include <iostream>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main() {
+    pid_t pid = fork();
+    if (pid == 0) {
+        char* args[] = {const_cast<char*>("ls"), nullptr};
+        execvp(args[0], args);
+        perror("execvp");
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+```
+
+That's a 20-line shell that runs `ls`. The rest of this track is a longer
+version of the same idea.
+
+## Pipes, briefly
+
+```c
+int pipe(int fd[2]);
+```
+
+Creates two file descriptors. Bytes written to `fd[1]` come out of `fd[0]`.
+Combined with `fork` and `dup2`, this is how `ls | grep cpp` works. We'll
+build it in lesson 4.
+
+## Redirection, briefly
+
+```c
+int dup2(int oldfd, int newfd);
+```
+
+Closes `newfd` and makes it refer to the same file as `oldfd`. The classic
+use: open a file, then `dup2(file_fd, STDOUT_FILENO)` so the child's stdout
+goes to the file. Lesson 4 again.
+
+## Signals, briefly
+
+`Ctrl+C` sends `SIGINT`. `Ctrl+Z` sends `SIGTSTP`. The shell ignores both
+(it would die otherwise) and forwards them to the foreground job. We'll
+handle this in lesson 5 (job control).
+
+## What we'll *not* use
+
+- Threads. A shell needs none.
+- Async I/O. Blocking syscalls everywhere.
+- External libraries — except `readline` (optional) for line editing.
+
+The standard library and POSIX are enough.
+
+## Reading
+
+Open these in another tab and skim:
+
+- `man 2 fork`
+- `man 2 execvp`
+- `man 2 waitpid`
+- `man 2 pipe`
+- `man 2 dup2`
+- `man 7 signal`
+
+You don't need to memorize them. You need to know they exist and what they
+roughly say.
+
+## Next
+
+We'll lay out the project skeleton, set up CMake, and write a no-op REPL —
+the loop we'll fill in for the rest of the track.

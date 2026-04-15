@@ -1,0 +1,312 @@
+---
+title: Project scaffold — listen and accept
+description: Lay out the project, write the socket loop, and serve a hard-coded reply.
+---
+
+# Project scaffold
+
+Let's get bytes on the wire. By the end of this lesson, you'll have a binary
+that listens on port 8080 and replies `hello` to any connection.
+
+## Directory layout
+
+```
+hsv/
+├── CMakeLists.txt
+├── README.md
+└── src/
+    ├── main.cpp
+    ├── socket.hpp
+    ├── socket.cpp
+    ├── server.hpp
+    └── server.cpp
+```
+
+(`hsv` for "HTTP serve". Name it whatever you like.)
+
+```bash
+mkdir -p hsv/src && cd hsv
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(hsv CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+add_executable(hsv
+    src/main.cpp
+    src/socket.cpp
+    src/server.cpp
+)
+
+target_include_directories(hsv PRIVATE src)
+```
+
+## A RAII socket wrapper
+
+Raw file descriptors leak. Wrap them.
+
+### src/socket.hpp
+
+```cpp
+#pragma once
+#include <utility>
+
+namespace hsv {
+
+class Socket {
+public:
+    Socket() = default;
+    explicit Socket(int fd) : fd_{fd} {}
+    ~Socket() { close(); }
+
+    Socket(const Socket&)            = delete;
+    Socket& operator=(const Socket&) = delete;
+
+    Socket(Socket&& o) noexcept : fd_{o.fd_} { o.fd_ = -1; }
+    Socket& operator=(Socket&& o) noexcept {
+        if (this != &o) { close(); fd_ = o.fd_; o.fd_ = -1; }
+        return *this;
+    }
+
+    int  get() const { return fd_; }
+    int  release() { int t = fd_; fd_ = -1; return t; }
+    void close();
+    bool valid() const { return fd_ >= 0; }
+
+private:
+    int fd_ = -1;
+};
+
+Socket listen_tcp(uint16_t port, int backlog = 128);
+
+}
+```
+
+### src/socket.cpp
+
+```cpp
+#include "socket.hpp"
+
+#include <arpa/inet.h>
+#include <cstring>
+#include <netinet/in.h>
+#include <stdexcept>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace hsv {
+
+void Socket::close() {
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+}
+
+Socket listen_tcp(uint16_t port, int backlog) {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) throw std::system_error(errno, std::generic_category(), "socket");
+    Socket s{fd};
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+        throw std::system_error(errno, std::generic_category(), "bind");
+
+    if (::listen(fd, backlog) < 0)
+        throw std::system_error(errno, std::generic_category(), "listen");
+
+    return s;
+}
+
+}
+```
+
+## A naive accept loop
+
+### src/server.hpp
+
+```cpp
+#pragma once
+#include <cstdint>
+
+namespace hsv {
+
+class Server {
+public:
+    explicit Server(uint16_t port) : port_{port} {}
+    void run();
+
+private:
+    uint16_t port_;
+};
+
+}
+```
+
+### src/server.cpp
+
+```cpp
+#include "server.hpp"
+#include "socket.hpp"
+
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <unistd.h>
+
+namespace hsv {
+
+namespace {
+constexpr const char* kReply =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 6\r\n"
+    "Content-Type: text/plain\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+    "hello\n";
+}  // anon
+
+void Server::run() {
+    Socket srv = listen_tcp(port_);
+    std::cout << "listening on " << port_ << '\n';
+
+    while (true) {
+        sockaddr_storage peer{};
+        socklen_t plen = sizeof(peer);
+        int cfd = accept(srv.get(), reinterpret_cast<sockaddr*>(&peer), &plen);
+        if (cfd < 0) {
+            std::perror("accept");
+            continue;
+        }
+        Socket client{cfd};
+
+        // drain whatever the client sent (we'll parse next lesson)
+        char tmp[1024];
+        recv(client.get(), tmp, sizeof(tmp), 0);
+
+        ::send(client.get(), kReply, std::strlen(kReply), 0);
+    }
+}
+
+}
+```
+
+## src/main.cpp
+
+```cpp
+#include "server.hpp"
+
+int main(int argc, char** argv) {
+    uint16_t port = (argc > 1) ? static_cast<uint16_t>(std::atoi(argv[1])) : 8080;
+    hsv::Server s{port};
+    s.run();
+    return 0;
+}
+```
+
+## Build and run
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/hsv 8080
+listening on 8080
+```
+
+In another terminal:
+
+```bash
+curl -v http://localhost:8080
+```
+
+You should see:
+
+```
+< HTTP/1.1 200 OK
+< Content-Length: 6
+< Content-Type: text/plain
+< Connection: close
+hello
+```
+
+That's the smallest functional web server.
+
+## A short-write helper
+
+`send` can return fewer bytes than you asked for. Wrap it:
+
+```cpp
+namespace hsv {
+
+bool send_all(int fd, const char* buf, std::size_t n) {
+    std::size_t sent = 0;
+    while (sent < n) {
+        ssize_t r = ::send(fd, buf + sent, n - sent, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0) return false;
+        sent += static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
+}
+```
+
+Add it to `socket.hpp` / `socket.cpp` and use it instead of bare `send` in the
+server.
+
+## Check leaks
+
+Run with sanitizers (already on in Debug). Hit it with a hundred requests:
+
+```bash
+for i in $(seq 1 100); do curl -s http://localhost:8080 >/dev/null; done
+```
+
+Stop the server (`Ctrl+C`). Look at the sanitizer output — should be clean.
+
+## Why this is enough
+
+We have:
+
+- Real TCP listening
+- Per-connection accept
+- A reply that browsers parse
+- RAII for FDs
+- Fail-loudly error paths
+
+Next lesson: parse the request properly. Until then, the server ignores
+what the client sent and replies with the same thing. That changes now.
+
+## Exercises
+
+1. Read `man 7 socket` and `man 2 setsockopt`. What does `SO_REUSEADDR`
+   actually do? When would `SO_REUSEPORT` be useful?
+2. Add a `--bind` flag to listen on a specific interface (`127.0.0.1` vs
+   `0.0.0.0`).
+3. Print the peer's IP and port on accept (use `inet_ntop`).
+4. Drop the `recv` and try `curl` again. Does it still work? Why or why not?
