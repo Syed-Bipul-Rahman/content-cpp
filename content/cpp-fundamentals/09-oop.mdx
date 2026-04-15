@@ -1,0 +1,287 @@
+---
+title: Inheritance, polymorphism, and virtual
+description: OOP in C++ — done properly, and only where it earns its keep.
+---
+
+# OOP: inheritance and polymorphism
+
+C++ supports object-oriented programming, but it's **not** an object-oriented
+language in the way Java or Smalltalk are. In C++, OOP is one tool. Templates,
+free functions, and concepts are others, and often better. Knowing when to
+reach for inheritance — and when not to — is the whole art.
+
+This lesson teaches the mechanics. The next lesson (RAII) teaches the mindset
+that makes modern C++ feel different from the textbook OOP you may have seen.
+
+## Inheritance
+
+A derived class extends a base class — adding members, overriding behavior:
+
+```cpp
+class Animal {
+public:
+    std::string name;
+    Animal(std::string n) : name{std::move(n)} {}
+    void eat() const { std::cout << name << " eats\n"; }
+};
+
+class Dog : public Animal {
+public:
+    Dog(std::string n) : Animal{std::move(n)} {}
+    void bark() const { std::cout << name << " barks\n"; }
+};
+
+Dog d{"Rex"};
+d.eat();   // inherited
+d.bark();  // own
+```
+
+`class Dog : public Animal` means **`Dog` is a kind of `Animal`**. Public
+inheritance is the "is-a" relationship. Private and protected inheritance
+exist but are rare — treat them as advanced.
+
+## Constructors flow upward
+
+The base constructor runs **before** the derived constructor. You forward
+arguments through the initializer list:
+
+```cpp
+Dog(std::string n) : Animal{std::move(n)} { }
+```
+
+Destructors run in reverse: derived first, then base.
+
+## Virtual functions — runtime polymorphism
+
+Here's the OOP payoff. Mark a method `virtual` so derived classes can
+**override** it, and callers decide at runtime which version runs:
+
+```cpp
+class Shape {
+public:
+    virtual ~Shape() = default;            // ALWAYS make base destructors virtual
+    virtual double area() const = 0;       // = 0 → pure virtual, no implementation
+    virtual std::string name() const { return "shape"; }
+};
+
+class Circle : public Shape {
+public:
+    Circle(double r) : radius{r} {}
+    double area() const override { return 3.14159 * radius * radius; }
+    std::string name() const override { return "circle"; }
+private:
+    double radius;
+};
+
+class Square : public Shape {
+public:
+    Square(double s) : side{s} {}
+    double area() const override { return side * side; }
+    std::string name() const override { return "square"; }
+private:
+    double side;
+};
+```
+
+Use them through a base pointer or reference:
+
+```cpp
+std::vector<std::unique_ptr<Shape>> shapes;
+shapes.push_back(std::make_unique<Circle>(5.0));
+shapes.push_back(std::make_unique<Square>(3.0));
+
+for (const auto& s : shapes) {
+    std::cout << s->name() << ": " << s->area() << '\n';
+}
+```
+
+The compiler resolves `s->area()` via a **virtual table** (vtable) — one
+indirect call per invocation. That's the runtime cost of polymorphism.
+
+## `override` and `final`
+
+Always mark overrides with `override`:
+
+```cpp
+double area() const override { return ...; }
+```
+
+If the signature doesn't actually match a base virtual, the compiler errors.
+Without `override`, you'll silently create a new unrelated method.
+
+Mark a class or method `final` to disallow further derivation:
+
+```cpp
+class Logger final { };                              // can't be derived
+virtual void draw() const final;                     // can't be overridden
+```
+
+Devirtualization is a real optimization — `final` lets the compiler inline.
+
+## The virtual destructor rule
+
+If you will ever delete through a base pointer, the base's destructor **must**
+be virtual:
+
+```cpp
+Shape* p = new Circle{3.0};
+delete p;       // if ~Shape isn't virtual → undefined behavior
+```
+
+Default to `virtual ~Base() = default;` on every polymorphic base. Always.
+
+## Abstract classes and interfaces
+
+A class with one or more pure virtual functions (`= 0`) is **abstract** — you
+can't instantiate it. It defines an interface:
+
+```cpp
+class Stream {
+public:
+    virtual ~Stream() = default;
+    virtual std::size_t read(char* buf, std::size_t n) = 0;
+    virtual std::size_t write(const char* buf, std::size_t n) = 0;
+};
+```
+
+Anything that implements `read` and `write` is a `Stream`. This is the
+building block of modular, pluggable systems.
+
+## Multiple inheritance (use sparingly)
+
+```cpp
+class Serializable { public: virtual ~Serializable() = default;
+                     virtual std::string dump() const = 0; };
+class Drawable     { public: virtual ~Drawable()     = default;
+                     virtual void draw() const = 0; };
+
+class Widget : public Serializable, public Drawable { /* ... */ };
+```
+
+Legal, occasionally useful for **interface mixing**. Avoid multiple inheritance
+of classes with state — it leads to the "diamond problem" and grief.
+
+## Slicing — a trap
+
+Copying a derived object into a base-typed variable **loses the derived
+parts**:
+
+```cpp
+Circle c{5.0};
+Shape s = c;        // slicing! s is just a Shape, not a Circle.
+```
+
+That's why you pass polymorphic types through pointers or references:
+
+```cpp
+void describe(const Shape& s);    // OK, no slicing
+void describe(Shape s);           // BUG, slices
+```
+
+## Prefer composition
+
+Before you inherit, ask: "does this really *have a* relationship, or *is a*?"
+If it's "has a", compose:
+
+```cpp
+class Logger {
+public:
+    void info(std::string_view msg);
+};
+
+class Service {
+    Logger logger;        // composition — Service has a Logger
+public:
+    void run() {
+        logger.info("running");
+    }
+};
+```
+
+Composition is flexible, testable, and avoids tight coupling.
+
+## When inheritance is right
+
+- **Plugin architectures.** Parsers, renderers, protocol handlers — any place
+  where callers hold a base pointer and the implementation varies.
+- **Frameworks.** The framework holds your `Handler*` and calls methods at
+  known points.
+- **Exception hierarchies.** Catch by base, throw specific.
+
+## When inheritance is wrong
+
+- To share code. Use free functions or composition instead.
+- To enable small behavioral tweaks. Pass a lambda or a `std::function`.
+- To model data variants. Use `std::variant` or tagged unions.
+
+## `dynamic_cast` and RTTI
+
+Runtime type inquiry — needed when you must downcast a base pointer:
+
+```cpp
+Shape* s = /* ... */;
+if (auto* c = dynamic_cast<Circle*>(s)) {
+    use(c->radius());      // s actually pointed to a Circle
+}
+```
+
+It works only on polymorphic types (at least one virtual function). Use
+sparingly — frequent `dynamic_cast` usually means your design wants `std::variant`.
+
+## Virtual vs variant — the modern split
+
+Two styles for "one of several types":
+
+**Classic OOP:**
+
+```cpp
+std::unique_ptr<Shape> s = std::make_unique<Circle>(5.0);
+std::cout << s->area();
+```
+
+**Variant (value-based polymorphism):**
+
+```cpp
+using Shape = std::variant<Circle, Square>;
+Shape s = Circle{5.0};
+std::visit([](const auto& x) { std::cout << x.area(); }, s);
+```
+
+- Variant: closed set of types, no inheritance, no heap allocation, no vtable.
+- Virtual: open set, extensible by users, indirection cost.
+
+If the set of types is closed and known, prefer variant. If plugins extend it,
+use virtual.
+
+## Rule of Five for polymorphic bases
+
+If a base is polymorphic, default its special members carefully:
+
+```cpp
+class Base {
+public:
+    virtual ~Base() = default;
+    Base() = default;
+    Base(const Base&) = default;
+    Base& operator=(const Base&) = default;
+    Base(Base&&) noexcept = default;
+    Base& operator=(Base&&) noexcept = default;
+};
+```
+
+…or simply make it **non-copyable and non-movable** if slicing would be a
+bug (usually).
+
+## Exercises
+
+1. Build a `Shape` hierarchy — `Circle`, `Square`, `Triangle` — and compute
+   total area of a `vector<unique_ptr<Shape>>`.
+2. Define a `Stream` abstract class and implement two concrete streams:
+   `FileStream` and `MemoryStream`. Write a function that copies bytes from
+   one to another through the interface.
+3. Re-implement exercise 1 using `std::variant` and `std::visit`. Compare
+   readability, binary size, and runtime.
+4. Make a base class with a non-virtual destructor. Delete a derived object
+   through a base pointer. Run under AddressSanitizer. What happens?
+5. Define a `Visitor` pattern for a small AST (`NumNode`, `AddNode`,
+   `MulNode`). Then redo it with `std::variant`. Which version is shorter?
