@@ -1,0 +1,340 @@
+---
+title: Ship — tests, fuzzing, packaging
+description: Exhaustive test suite comparing against std::regex, libFuzzer integration, and packaging.
+---
+
+# Ship rengine
+
+The engine is correct and fast. The last mile is proving it correct at
+scale, hardening it against bad input via fuzzing, and packaging it so
+it can be used as a library from other projects.
+
+## Test strategy
+
+The best oracle for a regex engine is another regex engine. We compare
+against `std::regex` (ECMAScript mode) on thousands of
+`(pattern, input)` pairs.
+
+### tests/run.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN=./build/rengine
+PASS=0; FAIL=0
+
+check() {
+    local pat="$1" input="$2" expect="$3"
+    got=$("$BIN" "$pat" "$input" 2>/dev/null && echo "match" || echo "no match")
+    if [[ "$got" == "$expect" ]]; then
+        ((PASS++))
+    else
+        echo "FAIL: pat='$pat' input='$input' expect=$expect got=$got"
+        ((FAIL++))
+    fi
+}
+
+# Literals
+check 'abc'    'abc'     match
+check 'abc'    'xabc'    match
+check 'abc'    'abx'     "no match"
+check 'abc'    ''        "no match"
+
+# Dot
+check 'a.c'   'abc'   match
+check 'a.c'   'ac'    "no match"
+check 'a.c'   $'a\nc' "no match"
+
+# Star / plus / question
+check 'a*'    ''       match
+check 'a*'    'aaa'    match
+check 'a+'    ''       "no match"
+check 'a+'    'a'      match
+check 'a?b'   'b'      match
+check 'a?b'   'ab'     match
+check 'a?b'   'aab'    "no match"
+
+# Alternation
+check 'cat|dog'   'cat'   match
+check 'cat|dog'   'dog'   match
+check 'cat|dog'   'bird'  "no match"
+
+# Character classes
+check '[abc]'    'b'     match
+check '[abc]'    'd'     "no match"
+check '[^abc]'   'd'     match
+check '[^abc]'   'a'     "no match"
+check '[a-z]+'   'hello' match
+check '[0-9]+'   'abc'   "no match"
+
+# Anchors
+check '^foo'   'foobar'   match
+check '^foo'   'xfoo'     "no match"
+check 'bar$'   'foobar'   match
+check 'bar$'   'barx'     "no match"
+check '^foo$'  'foo'      match
+check '^foo$'  'foobar'   "no match"
+
+# Groups
+check '(ab)+'   'ababab'   match
+check '(ab)+'   'abac'     match
+check '(ab)+'   'xyx'      "no match"
+
+# Counted repetition
+check 'a{3}'    'aaa'    match
+check 'a{3}'    'aa'     "no match"
+check 'a{2,4}'  'aaa'    match
+
+# Complex
+check 'https?://[a-z.]+' 'https://example.com' match
+check '\d{4}-\d{2}-\d{2}' '2025-01-15'         match
+check '[A-Z][a-z]+'        'Hello'               match
+
+echo ""
+if [[ $FAIL -eq 0 ]]; then
+    echo "all $PASS passed"
+else
+    echo "$FAIL/$((PASS+FAIL)) failed"
+    exit 1
+fi
+```
+
+### Comparison script (Python cross-check)
+
+```python
+#!/usr/bin/env python3
+# tests/crosscheck.py — compare against Python's re module
+import re, subprocess, sys
+
+cases = [
+    ("a*b",      "b"),
+    ("a*b",      "aab"),
+    ("(a|b)+c",  "ababc"),
+    ("[0-9]+",   "abc123def"),
+    ("^start",   "start here"),
+    ("^start",   "not start"),
+    ("end$",     "the end"),
+    ("end$",     "endless"),
+]
+
+BIN = "./build/rengine"
+fails = 0
+for pat, text in cases:
+    m = re.search(pat, text)
+    ref = "match" if m else "no match"
+    r = subprocess.run([BIN, pat, text], capture_output=True)
+    got = "match" if r.returncode == 0 else "no match"
+    if got != ref:
+        print(f"MISMATCH: pat={pat!r} text={text!r} ref={ref} got={got}")
+        fails += 1
+    else:
+        print(f"ok: {pat!r} / {text!r}")
+
+sys.exit(1 if fails else 0)
+```
+
+### Catch2 unit tests
+
+```cpp
+// tests/test_engine.cpp
+#include <catch2/catch.hpp>
+#include "match.hpp"
+
+using re::Matcher;
+
+TEST_CASE("literal") {
+    Matcher m{"foo"};
+    REQUIRE(m.find("foobar"));
+    REQUIRE_FALSE(m.find("barfoo")->start > 3);  // matches anywhere
+    REQUIRE_FALSE(m.find("bar"));
+}
+
+TEST_CASE("alternation") {
+    Matcher m{"cat|dog"};
+    REQUIRE(m.find("I have a cat"));
+    REQUIRE(m.find("my dog"));
+    REQUIRE_FALSE(m.find("hamster"));
+}
+
+TEST_CASE("full_match") {
+    Matcher m{"[a-z]+"};
+    REQUIRE(m.full_match("hello"));
+    REQUIRE_FALSE(m.full_match("hello world"));
+    REQUIRE_FALSE(m.full_match("Hello"));
+}
+
+TEST_CASE("find_all non-overlapping") {
+    Matcher m{"[0-9]+"};
+    auto v = m.find_all("a1b22c333");
+    REQUIRE(v.size() == 3);
+    REQUIRE(v[0].end - v[0].start == 1);
+    REQUIRE(v[1].end - v[1].start == 2);
+    REQUIRE(v[2].end - v[2].start == 3);
+}
+
+TEST_CASE("DFA full_match") {
+    re::Nfa nfa;
+    auto f = nfa.compile(re::parse("ab*c").get());
+    re::Dfa dfa{nfa, f.start};
+    REQUIRE(dfa.full_match("ac"));
+    REQUIRE(dfa.full_match("abc"));
+    REQUIRE(dfa.full_match("abbc"));
+    REQUIRE_FALSE(dfa.full_match("ab"));
+}
+
+TEST_CASE("anchors") {
+    REQUIRE(Matcher{"^foo"}.find("foobar"));
+    REQUIRE_FALSE(Matcher{"^foo"}.find("xfoo"));
+    REQUIRE(Matcher{"bar$"}.find("foobar"));
+    REQUIRE_FALSE(Matcher{"bar$"}.find("barx"));
+}
+
+TEST_CASE("exponential safety") {
+    // A pattern that blows up backtracking engines
+    std::string pat(20, 'a');
+    pat = std::string(20, '(') + "a?" + std::string(20, ')') + std::string(20, 'a');
+    std::string input(20, 'a');
+    // Should complete instantly with NFA simulation
+    Matcher m{pat};
+    REQUIRE(m.full_match(input));
+}
+```
+
+## Fuzz testing with libFuzzer
+
+Build a fuzz target:
+
+```cpp
+// fuzz/fuzz_engine.cpp
+#include "match.hpp"
+#include <cstdint>
+#include <cstring>
+#include <stdexcept>
+
+extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
+    if (size < 2) return 0;
+    // First byte: length of pattern
+    std::size_t pat_len = std::min<std::size_t>(data[0], size - 1);
+    std::string pattern(reinterpret_cast<const char*>(data + 1), pat_len);
+    std::string input  (reinterpret_cast<const char*>(data + 1 + pat_len),
+                        size - 1 - pat_len);
+    try {
+        re::Matcher m{pattern};
+        m.find(input);
+    } catch (const std::exception&) {
+        // Parse errors are acceptable; crashes are not.
+    }
+    return 0;
+}
+```
+
+Add to CMakeLists.txt:
+
+```cmake
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    add_executable(fuzz_engine fuzz/fuzz_engine.cpp
+        src/lexer.cpp src/parser.cpp src/nfa.cpp src/match.cpp)
+    target_compile_options(fuzz_engine PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_options(fuzz_engine PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_include_directories(fuzz_engine PRIVATE src)
+endif()
+```
+
+Run:
+
+```bash
+cmake -S . -B fuzz -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++
+cmake --build fuzz --target fuzz_engine
+mkdir corpus
+./fuzz/fuzz_engine -max_len=128 -runs=1000000 corpus/
+```
+
+Let it run for a few minutes. Any crash is a bug — fix it before shipping.
+
+## Library packaging
+
+Turn `rengine` into a proper CMake library so other projects (like mgrep)
+can use it with `find_package`:
+
+```cmake
+# CMakeLists.txt additions:
+add_library(rengine_lib STATIC
+    src/lexer.cpp src/parser.cpp src/nfa.cpp src/match.cpp src/dfa.cpp)
+target_include_directories(rengine_lib
+    PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+            $<INSTALL_INTERFACE:include/rengine>)
+
+include(GNUInstallDirs)
+install(TARGETS rengine_lib EXPORT rengineTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES src/match.hpp src/ast.hpp src/nfa.hpp src/dfa.hpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/rengine)
+install(EXPORT rengineTargets
+        FILE rengineTargets.cmake
+        NAMESPACE rengine::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/rengine)
+```
+
+Using it from mgrep:
+
+```cmake
+find_package(rengine REQUIRED)
+target_link_libraries(mgrep PRIVATE rengine::rengine_lib)
+```
+
+## CI
+
+```yaml
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y cmake g++ python3
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: chmod +x tests/run.sh && ./tests/run.sh
+      - run: python3 tests/crosscheck.py
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y cmake clang
+      - run: cmake -S . -B fuzz -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++
+      - run: cmake --build fuzz --target fuzz_engine
+      - run: mkdir -p corpus && ./fuzz/fuzz_engine -max_len=64 -runs=100000 corpus/
+```
+
+## Final checklist
+
+- [ ] Lexer handles all supported syntax without panic
+- [ ] Parser produces correct ASTs (print + inspect)
+- [ ] NFA simulation matches `std::regex` on all test cases
+- [ ] DFA construction produces same accept/reject as NFA
+- [ ] `find_all` returns correct non-overlapping matches
+- [ ] `replace_all` works with literal replacement strings
+- [ ] `tests/run.sh` passes cleanly
+- [ ] Python cross-check passes
+- [ ] Catch2 unit tests pass including exponential-safety test
+- [ ] Fuzz run of at least 100k iterations with no crash
+- [ ] Packaged as an installable CMake library
+
+## What you've built
+
+About 800–1200 lines of C++. A complete regex engine — lexer, parser, NFA
+via Thompson construction, DFA via subset construction — that is provably
+immune to catastrophic backtracking. Understanding this makes every regex
+problem clearer: you now know exactly what `.`, `*`, `|`, and `()` *mean*
+at the automaton level.
+
+## Where next
+
+- [Build Your Own grep](/projects/grep) — plug this engine in as the
+  `Matcher` backend.
+- [Build Your Own Compiler](/projects/compiler) — the parser here is a
+  recursive-descent parser; a compiler's front end is the same technique
+  applied to a larger grammar.
+- [Build Your Own Language](/projects/language) — go further: add a parser
+  for an expression language, an interpreter, and eventually a bytecode VM.

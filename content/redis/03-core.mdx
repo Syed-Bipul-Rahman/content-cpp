@@ -1,0 +1,444 @@
+---
+title: Core — String, List, pipelining, inline commands
+description: Implement GET/SET/INCR/APPEND for strings and LPUSH/RPUSH/LPOP/RPOP/LRANGE for lists.
+---
+
+# Core: String and List commands
+
+This lesson wires up the in-memory store and implements the two most
+common Redis data types. By the end, `redis-cli` can store strings, mutate
+counters, and push/pop from lists — all fully compatible with real Redis.
+
+## The store
+
+The store holds a map from key to a tagged value. Each value is one of our
+supported types.
+
+### src/store.hpp
+
+```cpp
+#pragma once
+#include <chrono>
+#include <deque>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+namespace redis {
+
+using Clock   = std::chrono::steady_clock;
+using TimePoint = Clock::time_point;
+
+struct StringVal { std::string data; };
+struct ListVal   { std::deque<std::string> data; };
+struct HashVal   { std::unordered_map<std::string, std::string> data; };
+struct SetVal    { std::unordered_map<std::string, int> data; };
+
+struct Entry {
+    std::variant<StringVal, ListVal, HashVal, SetVal> val;
+    std::optional<TimePoint> expires_at;
+
+    bool expired() const {
+        return expires_at && Clock::now() >= *expires_at;
+    }
+};
+
+class Store {
+public:
+    // Called by command dispatch.
+    std::string dispatch(std::string_view name,
+                         const std::vector<std::string_view>& args);
+
+    // Internal helpers used by command handlers.
+    Entry*        get(const std::string& key);   // null if missing or expired
+    void          del(const std::string& key);
+    void          set(std::string key, Entry e);
+
+private:
+    std::unordered_map<std::string, Entry> data_;
+
+    // Command handlers
+    std::string cmd_set   (const std::vector<std::string_view>& args);
+    std::string cmd_get   (const std::vector<std::string_view>& args);
+    std::string cmd_del   (const std::vector<std::string_view>& args);
+    std::string cmd_exists(const std::vector<std::string_view>& args);
+    std::string cmd_incr  (const std::vector<std::string_view>& args);
+    std::string cmd_incrby(const std::vector<std::string_view>& args);
+    std::string cmd_append(const std::vector<std::string_view>& args);
+    std::string cmd_strlen(const std::vector<std::string_view>& args);
+    std::string cmd_mset  (const std::vector<std::string_view>& args);
+    std::string cmd_mget  (const std::vector<std::string_view>& args);
+    std::string cmd_lpush (const std::vector<std::string_view>& args);
+    std::string cmd_rpush (const std::vector<std::string_view>& args);
+    std::string cmd_lpop  (const std::vector<std::string_view>& args);
+    std::string cmd_rpop  (const std::vector<std::string_view>& args);
+    std::string cmd_llen  (const std::vector<std::string_view>& args);
+    std::string cmd_lrange(const std::vector<std::string_view>& args);
+    std::string cmd_lindex(const std::vector<std::string_view>& args);
+    std::string cmd_keys  (const std::vector<std::string_view>& args);
+    std::string cmd_type  (const std::vector<std::string_view>& args);
+    std::string cmd_dbsize(const std::vector<std::string_view>& args);
+    std::string cmd_flushdb(const std::vector<std::string_view>& args);
+};
+
+}
+```
+
+### src/store.cpp
+
+```cpp
+#include "store.hpp"
+#include "resp.hpp"
+
+#include <charconv>
+#include <stdexcept>
+
+namespace redis {
+
+Entry* Store::get(const std::string& key) {
+    auto it = data_.find(key);
+    if (it == data_.end()) return nullptr;
+    if (it->second.expired()) { data_.erase(it); return nullptr; }
+    return &it->second;
+}
+
+void Store::del(const std::string& key) { data_.erase(key); }
+
+void Store::set(std::string key, Entry e) { data_[std::move(key)] = std::move(e); }
+
+static long long to_ll(std::string_view s) {
+    long long n = 0;
+    auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), n);
+    if (ec != std::errc{} || p != s.data() + s.size())
+        throw std::runtime_error("value is not an integer or out of range");
+    return n;
+}
+
+// ------- String commands -------
+
+std::string Store::cmd_set(const std::vector<std::string_view>& args) {
+    if (args.size() < 2) return err("wrong number of arguments");
+    Entry e; e.val = StringVal{std::string{args[1]}};
+
+    // Optional EX / PX / EXAT / PXAT flags
+    for (std::size_t i = 2; i < args.size(); i += 2) {
+        if (i + 1 >= args.size()) break;
+        auto flag = args[i];
+        long long n = to_ll(args[i + 1]);
+        if      (flag == "EX")   e.expires_at = Clock::now() + std::chrono::seconds{n};
+        else if (flag == "PX")   e.expires_at = Clock::now() + std::chrono::milliseconds{n};
+    }
+    set(std::string{args[0]}, std::move(e));
+    return ok();
+}
+
+std::string Store::cmd_get(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return null_bulk();
+    auto* sv = std::get_if<StringVal>(&e->val);
+    if (!sv) return err("WRONGTYPE Operation against a key holding the wrong kind of value");
+    return bulk_string(sv->data);
+}
+
+std::string Store::cmd_del(const std::vector<std::string_view>& args) {
+    long long n = 0;
+    for (auto a : args) { if (get(std::string{a})) { del(std::string{a}); ++n; } }
+    return integer_resp(n);
+}
+
+std::string Store::cmd_exists(const std::vector<std::string_view>& args) {
+    long long n = 0;
+    for (auto a : args) if (get(std::string{a})) ++n;
+    return integer_resp(n);
+}
+
+std::string Store::cmd_incr(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto key = std::string{args[0]};
+    auto* e = get(key);
+    if (!e) {
+        set(key, {StringVal{"1"}, {}});
+        return integer_resp(1);
+    }
+    auto* sv = std::get_if<StringVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    try {
+        long long n = to_ll(sv->data) + 1;
+        sv->data = std::to_string(n);
+        return integer_resp(n);
+    } catch (...) { return err("value is not an integer or out of range"); }
+}
+
+std::string Store::cmd_incrby(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    long long by;
+    try { by = to_ll(args[1]); } catch (...) { return err("not an integer"); }
+    auto key = std::string{args[0]};
+    auto* e = get(key);
+    if (!e) {
+        set(key, {StringVal{std::to_string(by)}, {}});
+        return integer_resp(by);
+    }
+    auto* sv = std::get_if<StringVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    try {
+        long long n = to_ll(sv->data) + by;
+        sv->data = std::to_string(n);
+        return integer_resp(n);
+    } catch (...) { return err("value is not an integer or out of range"); }
+}
+
+std::string Store::cmd_append(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    auto key = std::string{args[0]};
+    auto* e = get(key);
+    if (!e) {
+        set(key, {StringVal{std::string{args[1]}}, {}});
+        return integer_resp(static_cast<long long>(args[1].size()));
+    }
+    auto* sv = std::get_if<StringVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    sv->data += args[1];
+    return integer_resp(static_cast<long long>(sv->data.size()));
+}
+
+std::string Store::cmd_strlen(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* sv = std::get_if<StringVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    return integer_resp(static_cast<long long>(sv->data.size()));
+}
+
+std::string Store::cmd_mset(const std::vector<std::string_view>& args) {
+    if (args.size() % 2 != 0) return err("wrong number of arguments");
+    for (std::size_t i = 0; i < args.size(); i += 2)
+        set(std::string{args[i]}, {StringVal{std::string{args[i+1]}}, {}});
+    return ok();
+}
+
+std::string Store::cmd_mget(const std::vector<std::string_view>& args) {
+    std::string out = "*" + std::to_string(args.size()) + "\r\n";
+    for (auto a : args) {
+        auto* e = get(std::string{a});
+        if (!e) { out += null_bulk(); continue; }
+        auto* sv = std::get_if<StringVal>(&e->val);
+        out += sv ? bulk_string(sv->data) : null_bulk();
+    }
+    return out;
+}
+
+// ------- List commands -------
+
+std::string Store::cmd_lpush(const std::vector<std::string_view>& args) {
+    if (args.size() < 2) return err("wrong number of arguments");
+    auto key = std::string{args[0]};
+    auto* e = get(key);
+    if (!e) { set(key, {ListVal{}, {}}); e = get(key); }
+    auto* lv = std::get_if<ListVal>(&e->val);
+    if (!lv) return err("WRONGTYPE");
+    for (std::size_t i = 1; i < args.size(); ++i)
+        lv->data.push_front(std::string{args[i]});
+    return integer_resp(static_cast<long long>(lv->data.size()));
+}
+
+std::string Store::cmd_rpush(const std::vector<std::string_view>& args) {
+    if (args.size() < 2) return err("wrong number of arguments");
+    auto key = std::string{args[0]};
+    auto* e = get(key);
+    if (!e) { set(key, {ListVal{}, {}}); e = get(key); }
+    auto* lv = std::get_if<ListVal>(&e->val);
+    if (!lv) return err("WRONGTYPE");
+    for (std::size_t i = 1; i < args.size(); ++i)
+        lv->data.push_back(std::string{args[i]});
+    return integer_resp(static_cast<long long>(lv->data.size()));
+}
+
+std::string Store::cmd_lpop(const std::vector<std::string_view>& args) {
+    if (args.empty()) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return null_bulk();
+    auto* lv = std::get_if<ListVal>(&e->val);
+    if (!lv) return err("WRONGTYPE");
+    if (lv->data.empty()) return null_bulk();
+    auto v = lv->data.front(); lv->data.pop_front();
+    if (lv->data.empty()) del(std::string{args[0]});
+    return bulk_string(v);
+}
+
+std::string Store::cmd_rpop(const std::vector<std::string_view>& args) {
+    if (args.empty()) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return null_bulk();
+    auto* lv = std::get_if<ListVal>(&e->val);
+    if (!lv) return err("WRONGTYPE");
+    if (lv->data.empty()) return null_bulk();
+    auto v = lv->data.back(); lv->data.pop_back();
+    if (lv->data.empty()) del(std::string{args[0]});
+    return bulk_string(v);
+}
+
+std::string Store::cmd_llen(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* lv = std::get_if<ListVal>(&e->val);
+    if (!lv) return err("WRONGTYPE");
+    return integer_resp(static_cast<long long>(lv->data.size()));
+}
+
+std::string Store::cmd_lrange(const std::vector<std::string_view>& args) {
+    if (args.size() != 3) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return "*0\r\n";
+    auto* lv = std::get_if<ListVal>(&e->val);
+    if (!lv) return err("WRONGTYPE");
+    long long sz = static_cast<long long>(lv->data.size());
+    long long start = to_ll(args[1]);
+    long long stop  = to_ll(args[2]);
+    if (start < 0) start = std::max(0LL, sz + start);
+    if (stop  < 0) stop  = sz + stop;
+    stop = std::min(stop, sz - 1);
+    if (start > stop) return "*0\r\n";
+    std::vector<std::string> out;
+    for (long long i = start; i <= stop; ++i)
+        out.push_back(lv->data[static_cast<std::size_t>(i)]);
+    return array_resp(out);
+}
+
+std::string Store::cmd_lindex(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return null_bulk();
+    auto* lv = std::get_if<ListVal>(&e->val);
+    if (!lv) return err("WRONGTYPE");
+    long long idx = to_ll(args[1]);
+    if (idx < 0) idx += static_cast<long long>(lv->data.size());
+    if (idx < 0 || idx >= static_cast<long long>(lv->data.size())) return null_bulk();
+    return bulk_string(lv->data[static_cast<std::size_t>(idx)]);
+}
+
+// ------- Utility commands -------
+
+std::string Store::cmd_keys(const std::vector<std::string_view>&) {
+    std::vector<std::string> out;
+    for (const auto& [k, v] : data_)
+        if (!v.expired()) out.push_back(k);
+    return array_resp(out);
+}
+
+std::string Store::cmd_type(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return "+none\r\n";
+    return std::visit([](const auto& v) -> std::string {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, StringVal>) return "+string\r\n";
+        if constexpr (std::is_same_v<T, ListVal>)   return "+list\r\n";
+        if constexpr (std::is_same_v<T, HashVal>)   return "+hash\r\n";
+        if constexpr (std::is_same_v<T, SetVal>)    return "+set\r\n";
+        return "+none\r\n";
+    }, e->val);
+}
+
+std::string Store::cmd_dbsize(const std::vector<std::string_view>&) {
+    return integer_resp(static_cast<long long>(data_.size()));
+}
+
+std::string Store::cmd_flushdb(const std::vector<std::string_view>&) {
+    data_.clear(); return ok();
+}
+
+// ------- Dispatch -------
+
+std::string Store::dispatch(std::string_view name,
+                             const std::vector<std::string_view>& args) {
+    if (name == "SET")     return cmd_set(args);
+    if (name == "GET")     return cmd_get(args);
+    if (name == "DEL")     return cmd_del(args);
+    if (name == "EXISTS")  return cmd_exists(args);
+    if (name == "INCR")    return cmd_incr(args);
+    if (name == "INCRBY")  return cmd_incrby(args);
+    if (name == "APPEND")  return cmd_append(args);
+    if (name == "STRLEN")  return cmd_strlen(args);
+    if (name == "MSET")    return cmd_mset(args);
+    if (name == "MGET")    return cmd_mget(args);
+    if (name == "LPUSH")   return cmd_lpush(args);
+    if (name == "RPUSH")   return cmd_rpush(args);
+    if (name == "LPOP")    return cmd_lpop(args);
+    if (name == "RPOP")    return cmd_rpop(args);
+    if (name == "LLEN")    return cmd_llen(args);
+    if (name == "LRANGE")  return cmd_lrange(args);
+    if (name == "LINDEX")  return cmd_lindex(args);
+    if (name == "KEYS")    return cmd_keys(args);
+    if (name == "TYPE")    return cmd_type(args);
+    if (name == "DBSIZE")  return cmd_dbsize(args);
+    if (name == "FLUSHDB") return cmd_flushdb(args);
+    return err("unknown command '" + std::string{name} + "'");
+}
+
+}
+```
+
+## Try it
+
+```bash
+cmake --build build
+./build/myredis --port 6380 &
+
+redis-cli -p 6380 SET greeting "Hello, myredis"
+redis-cli -p 6380 GET greeting
+# "Hello, myredis"
+
+redis-cli -p 6380 INCR counter
+redis-cli -p 6380 INCR counter
+redis-cli -p 6380 GET counter
+# "2"
+
+redis-cli -p 6380 RPUSH mylist a b c
+redis-cli -p 6380 LRANGE mylist 0 -1
+# 1) "a"
+# 2) "b"
+# 3) "c"
+
+redis-cli -p 6380 LPOP mylist
+# "a"
+
+redis-cli -p 6380 MSET k1 v1 k2 v2 k3 v3
+redis-cli -p 6380 MGET k1 k2 k3
+# 1) "v1"
+# 2) "v2"
+# 3) "v3"
+```
+
+## Pipelining
+
+Redis pipelining means the client sends multiple commands without waiting
+for each response. Our `client.cpp` already handles this: the `while` loop
+in `process()` keeps parsing until `rbuf` is exhausted, appending all
+responses to `wbuf`. Nothing extra to add.
+
+Test it:
+
+```bash
+(echo -e "*1\r\n\$4\r\nPING\r\n*3\r\n\$3\r\nSET\r\n\$3\r\nfoo\r\n\$3\r\nbar\r\n*2\r\n\$3\r\nGET\r\n\$3\r\nfoo\r\n"; sleep 0.2) | nc localhost 6380
+# +PONG
+# +OK
+# $3
+# bar
+```
+
+Three commands, three responses, one TCP round trip.
+
+## Exercises
+
+1. Implement `SETNX` (set if not exists) and `GETSET`.
+2. Implement `LSET key index value` and `LINSERT key BEFORE|AFTER pivot value`.
+3. Implement `DECR` and `DECRBY`.
+4. Implement negative-index `LPOP`/`RPOP` count variant (Redis 6.2+):
+   `LPOP key 3` pops 3 elements at once.

@@ -1,0 +1,436 @@
+---
+title: Project scaffold — lexer, AST, parser
+description: Directory layout, CMake, the token stream, and a recursive-descent parser that produces an AST.
+---
+
+# Project scaffold
+
+By the end of this lesson you have a parser that turns `"a(b|c)*d"` into a
+well-typed AST you can inspect. No matching yet — just the front end.
+
+## Directory layout
+
+```
+rengine/
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── lexer.hpp/.cpp
+│   ├── ast.hpp
+│   ├── parser.hpp/.cpp
+│   ├── nfa.hpp/.cpp
+│   └── match.hpp/.cpp
+└── tests/
+    └── run.sh
+```
+
+```bash
+mkdir -p rengine/{src,tests} && cd rengine
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(rengine CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+add_executable(rengine
+    src/main.cpp
+    src/lexer.cpp
+    src/parser.cpp
+    src/nfa.cpp
+    src/match.cpp
+)
+target_include_directories(rengine PRIVATE src)
+```
+
+## Lexer
+
+The lexer converts the raw regex string into a flat list of tokens.
+
+### src/lexer.hpp
+
+```cpp
+#pragma once
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace re {
+
+enum class TK {
+    Literal,     // any single character
+    Dot,         // .
+    Star,        // *
+    Plus,        // +
+    Quest,       // ?
+    Pipe,        // |
+    LParen,      // (
+    RParen,      // )
+    LBracket,    // [ — class start
+    RBracket,    // ]
+    Caret,       // ^ (anchor or negation inside class)
+    Dollar,      // $
+    LBrace,      // {
+    RBrace,      // }
+    Comma,       // , (inside {n,m})
+    End,
+};
+
+struct Token {
+    TK   kind;
+    char ch{};   // valid when kind == Literal
+};
+
+std::vector<Token> lex(std::string_view pattern);
+
+}
+```
+
+### src/lexer.cpp
+
+```cpp
+#include "lexer.hpp"
+#include <cctype>
+#include <stdexcept>
+
+namespace re {
+
+static char escape(char c) {
+    switch (c) {
+        case 'n': return '\n';
+        case 't': return '\t';
+        case 'r': return '\r';
+        default:  return c;   // \d \w \s handled in parser
+    }
+}
+
+std::vector<Token> lex(std::string_view p) {
+    std::vector<Token> out;
+    for (std::size_t i = 0; i < p.size(); ++i) {
+        char c = p[i];
+        switch (c) {
+            case '.':  out.push_back({TK::Dot});      break;
+            case '*':  out.push_back({TK::Star});     break;
+            case '+':  out.push_back({TK::Plus});     break;
+            case '?':  out.push_back({TK::Quest});    break;
+            case '|':  out.push_back({TK::Pipe});     break;
+            case '(':  out.push_back({TK::LParen});   break;
+            case ')':  out.push_back({TK::RParen});   break;
+            case '[':  out.push_back({TK::LBracket}); break;
+            case ']':  out.push_back({TK::RBracket}); break;
+            case '^':  out.push_back({TK::Caret});    break;
+            case '$':  out.push_back({TK::Dollar});   break;
+            case '{':  out.push_back({TK::LBrace});   break;
+            case '}':  out.push_back({TK::RBrace});   break;
+            case ',':  out.push_back({TK::Comma});    break;
+            case '\\':
+                if (i + 1 >= p.size()) throw std::runtime_error("trailing backslash");
+                ++i;
+                out.push_back({TK::Literal, escape(p[i])});
+                break;
+            default:
+                out.push_back({TK::Literal, c});
+        }
+    }
+    out.push_back({TK::End});
+    return out;
+}
+
+}
+```
+
+## AST
+
+The AST uses a tagged union via `std::variant`. Each node is one of:
+
+```cpp
+// src/ast.hpp
+#pragma once
+#include <memory>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace re {
+
+struct AstLiteral  { char ch; };
+struct AstDot      {};
+struct AstAnchorB  { bool start; };   // ^=true $=false
+struct AstClass    { std::string chars; bool negated; };  // [abc] or [^abc]
+
+struct AstNode;
+using AstPtr = std::unique_ptr<AstNode>;
+
+struct AstConcat   { std::vector<AstPtr> children; };
+struct AstAlt      { AstPtr left; AstPtr right; };
+struct AstRepeat   { AstPtr child; int min; int max; };  // max=-1 means infinity
+struct AstGroup    { AstPtr child; int index; };         // capture group
+
+struct AstNode {
+    std::variant<
+        AstLiteral, AstDot, AstAnchorB, AstClass,
+        AstConcat, AstAlt, AstRepeat, AstGroup
+    > v;
+
+    template<typename T, typename... Args>
+    static AstPtr make(Args&&... a) {
+        auto n = std::make_unique<AstNode>();
+        n->v = T{std::forward<Args>(a)...};
+        return n;
+    }
+};
+
+}
+```
+
+## Parser
+
+A classic recursive-descent regex parser. Grammar (simplified):
+
+```
+expr    ::= alt
+alt     ::= concat ('|' concat)*
+concat  ::= repeat*
+repeat  ::= atom quantifier?
+quantifier ::= '*' | '+' | '?' | '{' n (',' m?)? '}'
+atom    ::= '.' | char | group | class
+group   ::= '(' expr ')'
+class   ::= '[' '^'? class-item+ ']'
+class-item ::= char ('-' char)?
+```
+
+### src/parser.hpp
+
+```cpp
+#pragma once
+#include "ast.hpp"
+#include <string_view>
+
+namespace re {
+
+AstPtr parse(std::string_view pattern);
+
+}
+```
+
+### src/parser.cpp
+
+```cpp
+#include "parser.hpp"
+#include "lexer.hpp"
+
+#include <stdexcept>
+#include <string>
+
+namespace re {
+
+class Parser {
+public:
+    explicit Parser(std::string_view p) : tokens_{lex(p)}, pos_{0}, group_idx_{0} {}
+    AstPtr parse_expr() { return parse_alt(); }
+
+private:
+    std::vector<Token> tokens_;
+    std::size_t pos_;
+    int         group_idx_;
+
+    Token peek()  const { return tokens_[pos_]; }
+    Token advance()     { return tokens_[pos_++]; }
+    bool  at_end() const { return tokens_[pos_].kind == TK::End; }
+    bool  check(TK k)   { return peek().kind == k; }
+    bool  eat(TK k)     { if (check(k)) { advance(); return true; } return false; }
+
+    AstPtr parse_alt() {
+        auto left = parse_concat();
+        while (eat(TK::Pipe)) {
+            auto right = parse_concat();
+            left = AstNode::make<AstAlt>(std::move(left), std::move(right));
+        }
+        return left;
+    }
+
+    AstPtr parse_concat() {
+        std::vector<AstPtr> parts;
+        while (!at_end() && !check(TK::RParen) && !check(TK::Pipe)) {
+            parts.push_back(parse_repeat());
+        }
+        if (parts.size() == 1) return std::move(parts[0]);
+        return AstNode::make<AstConcat>(std::move(parts));
+    }
+
+    AstPtr parse_repeat() {
+        auto atom = parse_atom();
+        if (eat(TK::Star))  return AstNode::make<AstRepeat>(std::move(atom), 0, -1);
+        if (eat(TK::Plus))  return AstNode::make<AstRepeat>(std::move(atom), 1, -1);
+        if (eat(TK::Quest)) return AstNode::make<AstRepeat>(std::move(atom), 0,  1);
+        if (eat(TK::LBrace)) return parse_counted(std::move(atom));
+        return atom;
+    }
+
+    AstPtr parse_counted(AstPtr atom) {
+        int n = parse_int();
+        int m = n;
+        if (eat(TK::Comma)) {
+            if (check(TK::RBrace)) m = -1;
+            else                   m = parse_int();
+        }
+        if (!eat(TK::RBrace)) throw std::runtime_error("expected }");
+        return AstNode::make<AstRepeat>(std::move(atom), n, m);
+    }
+
+    int parse_int() {
+        if (!check(TK::Literal) || !std::isdigit(static_cast<unsigned char>(peek().ch)))
+            throw std::runtime_error("expected digit");
+        int v = 0;
+        while (check(TK::Literal) && std::isdigit(static_cast<unsigned char>(peek().ch)))
+            v = v * 10 + (advance().ch - '0');
+        return v;
+    }
+
+    AstPtr parse_atom() {
+        if (eat(TK::Dot)) return AstNode::make<AstDot>();
+        if (eat(TK::Caret))  return AstNode::make<AstAnchorB>(true);
+        if (eat(TK::Dollar)) return AstNode::make<AstAnchorB>(false);
+        if (eat(TK::LParen)) {
+            int idx = ++group_idx_;
+            auto inner = parse_alt();
+            if (!eat(TK::RParen)) throw std::runtime_error("unmatched (");
+            return AstNode::make<AstGroup>(std::move(inner), idx);
+        }
+        if (eat(TK::LBracket)) return parse_class();
+        if (check(TK::Literal)) {
+            char c = advance().ch;
+            return AstNode::make<AstLiteral>(c);
+        }
+        throw std::runtime_error("unexpected token in atom");
+    }
+
+    AstPtr parse_class() {
+        bool neg = eat(TK::Caret);
+        std::string chars;
+        while (!check(TK::RBracket) && !at_end()) {
+            char a = advance().ch;
+            if (check(TK::Literal) && peek().ch == '-') {
+                advance();  // consume '-'
+                if (!check(TK::RBracket)) {
+                    char b = advance().ch;
+                    for (char x = a; x <= b; ++x) chars.push_back(x);
+                    continue;
+                }
+                chars.push_back(a);
+                chars.push_back('-');
+                continue;
+            }
+            chars.push_back(a);
+        }
+        if (!eat(TK::RBracket)) throw std::runtime_error("unclosed [");
+        return AstNode::make<AstClass>(std::move(chars), neg);
+    }
+};
+
+AstPtr parse(std::string_view p) {
+    Parser pr{p};
+    auto ast = pr.parse_expr();
+    return ast;
+}
+
+}
+```
+
+## main.cpp — print the AST
+
+```cpp
+#include "parser.hpp"
+#include <iostream>
+#include <stdexcept>
+
+static void print(const re::AstNode* n, int depth = 0) {
+    std::string indent(depth * 2, ' ');
+    std::visit([&](const auto& v) {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, re::AstLiteral>)
+            std::cout << indent << "Literal('" << v.ch << "')\n";
+        else if constexpr (std::is_same_v<T, re::AstDot>)
+            std::cout << indent << "Dot\n";
+        else if constexpr (std::is_same_v<T, re::AstAnchorB>)
+            std::cout << indent << (v.start ? "^" : "$") << '\n';
+        else if constexpr (std::is_same_v<T, re::AstClass>)
+            std::cout << indent << "Class[" << (v.negated?"^":"") << v.chars << "]\n";
+        else if constexpr (std::is_same_v<T, re::AstConcat>) {
+            std::cout << indent << "Concat\n";
+            for (const auto& c : v.children) print(c.get(), depth + 1);
+        } else if constexpr (std::is_same_v<T, re::AstAlt>) {
+            std::cout << indent << "Alt\n";
+            print(v.left.get(),  depth + 1);
+            print(v.right.get(), depth + 1);
+        } else if constexpr (std::is_same_v<T, re::AstRepeat>) {
+            std::cout << indent << "Repeat{" << v.min << ","
+                      << (v.max < 0 ? "∞" : std::to_string(v.max)) << "}\n";
+            print(v.child.get(), depth + 1);
+        } else if constexpr (std::is_same_v<T, re::AstGroup>) {
+            std::cout << indent << "Group(" << v.index << ")\n";
+            print(v.child.get(), depth + 1);
+        }
+    }, n->v);
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) { std::cerr << "usage: rengine <pattern> [input]\n"; return 2; }
+    try {
+        auto ast = re::parse(argv[1]);
+        print(ast.get());
+    } catch (const std::exception& e) {
+        std::cerr << "parse error: " << e.what() << '\n'; return 2;
+    }
+}
+```
+
+## Build and try
+
+```bash
+cmake -S . -B build
+cmake --build build
+
+./build/rengine 'a(b|c)*d'
+# Concat
+#   Literal('a')
+#   Group(1)
+#     Repeat{0,∞}
+#       Alt
+#         Literal('b')
+#         Literal('c')
+#   Literal('d')
+
+./build/rengine '^foo[a-z]+$'
+# Concat
+#   ^
+#   Literal('f')
+#   Literal('o')
+#   Literal('o')
+#   Repeat{1,∞}
+#     Class[a-z]
+#   $
+```
+
+## Exercises
+
+1. Add non-capturing groups `(?:…)` — parse them like groups but don't
+   increment `group_idx_`.
+2. Expand `\d`, `\w`, `\s` in the lexer into `AstClass` nodes rather than
+   treating them as literals.
+3. Print the AST as a GraphViz `.dot` file so you can visualize it.
+4. Add a validator pass over the AST that catches `{3,1}` (min > max) and
+   other bad patterns.

@@ -1,0 +1,321 @@
+---
+title: Ship — tests against redis-cli, benchmarks, packaging
+description: Test against the real redis-cli, benchmark with redis-benchmark, and package myredis.
+---
+
+# Ship myredis
+
+The server handles all major data types and persists to disk. The last mile
+is a rigorous test suite that uses the real `redis-cli` as the oracle,
+a benchmark against the official `redis-benchmark` tool, and packaging.
+
+## Test suite
+
+### tests/run.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT=${MYREDIS_PORT:-7379}
+BIN=./build/myredis
+CLI="redis-cli -p $PORT"
+
+# Start server
+"$BIN" --port $PORT &
+SRV_PID=$!
+trap 'kill $SRV_PID 2>/dev/null; true' EXIT
+sleep 0.3   # let it bind
+
+PASS=0; FAIL=0
+
+ok()   { echo "ok: $*";   ((PASS++)); }
+fail() { echo "FAIL: $*"; ((FAIL++)); }
+
+check() {
+    local desc="$1"; local expected="$2"; shift 2
+    local got
+    got=$($CLI "$@" 2>/dev/null)
+    if [[ "$got" == "$expected" ]]; then ok "$desc";
+    else fail "$desc — expected '$expected' got '$got'"; fi
+}
+
+# PING
+check "PING"              "PONG"     PING
+check "PING with message" "hello"    PING hello
+
+# SET / GET
+$CLI SET foo bar > /dev/null
+check "GET existing"     "bar"       GET foo
+check "GET missing"      ""          GET nosuchkey
+
+# INCR / INCRBY
+$CLI SET counter 10 > /dev/null
+check "INCR"    "11"  INCR counter
+check "INCRBY"  "16"  INCRBY counter 5
+
+# APPEND / STRLEN
+$CLI SET s "hello" > /dev/null
+check "APPEND"  "10"    APPEND s " world"
+check "STRLEN"  "10"    STRLEN s
+check "GET str" "hello world" GET s
+
+# MSET / MGET
+$CLI MSET k1 v1 k2 v2 k3 v3 > /dev/null
+check "MGET"  "v1
+v2
+v3"  MGET k1 k2 k3
+
+# DEL / EXISTS
+$CLI SET delme x > /dev/null
+check "EXISTS before del" "1" EXISTS delme
+$CLI DEL delme > /dev/null
+check "EXISTS after del"  "0" EXISTS delme
+
+# LIST
+$CLI DEL mylist > /dev/null
+$CLI RPUSH mylist a b c > /dev/null
+check "LLEN"   "3"      LLEN mylist
+check "LINDEX" "b"      LINDEX mylist 1
+check "LRANGE" "a
+b
+c"              LRANGE mylist 0 -1
+check "LPOP"   "a"      LPOP mylist
+check "RPOP"   "c"      RPOP mylist
+check "LLEN after pops" "1" LLEN mylist
+
+# HASH
+$CLI DEL user:1 > /dev/null
+$CLI HSET user:1 name Alice age 30 > /dev/null
+check "HGET"   "Alice"  HGET user:1 name
+check "HLEN"   "2"      HLEN user:1
+check "HEXISTS" "1"     HEXISTS user:1 age
+$CLI HDEL user:1 age > /dev/null
+check "HEXISTS after del" "0" HEXISTS user:1 age
+
+# SET (data type)
+$CLI DEL fruits > /dev/null
+$CLI SADD fruits apple banana cherry > /dev/null
+check "SCARD"      "3"   SCARD fruits
+check "SISMEMBER"  "1"   SISMEMBER fruits banana
+check "SISMEMBER"  "0"   SISMEMBER fruits mango
+$CLI SREM fruits banana > /dev/null
+check "SCARD after rem" "2" SCARD fruits
+
+# TTL / EXPIRE / PERSIST
+$CLI SET ttlkey "x" > /dev/null
+$CLI EXPIRE ttlkey 100 > /dev/null
+TTL=$($CLI TTL ttlkey)
+[[ "$TTL" -gt 90 && "$TTL" -le 100 ]] && ok "TTL in range" || fail "TTL: $TTL"
+$CLI PERSIST ttlkey > /dev/null
+check "TTL after PERSIST" "-1" TTL ttlkey
+
+# TYPE
+$CLI SET strkey v > /dev/null
+check "TYPE string" "string" TYPE strkey
+check "TYPE list"   "list"   TYPE mylist
+check "TYPE hash"   "hash"   TYPE user:1
+
+# FLUSHDB
+$CLI FLUSHDB > /dev/null
+check "DBSIZE after flush" "0" DBSIZE
+
+# SAVE / reload
+$CLI SET persistent "yes" > /dev/null
+$CLI SAVE > /dev/null
+kill "$SRV_PID"; sleep 0.3
+"$BIN" --port $PORT &
+SRV_PID=$!
+sleep 0.3
+check "Persisted after restart" "yes" GET persistent
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
+```
+
+```bash
+chmod +x tests/run.sh
+./tests/run.sh
+```
+
+### Unit tests for the RESP parser
+
+```cpp
+// tests/test_resp.cpp  (Catch2)
+#include <catch2/catch.hpp>
+#include "resp.hpp"
+
+TEST_CASE("simple string") {
+    auto r = redis::parse("+OK\r\n");
+    REQUIRE(r.has_value());
+    auto* s = std::get_if<std::string>(&r->value.v);
+    REQUIRE(s); REQUIRE(*s == "OK");
+    REQUIRE(r->consumed == 5);
+}
+
+TEST_CASE("bulk string") {
+    auto r = redis::parse("$5\r\nhello\r\n");
+    REQUIRE(r.has_value());
+    auto* s = std::get_if<std::string>(&r->value.v);
+    REQUIRE(s); REQUIRE(*s == "hello");
+}
+
+TEST_CASE("null bulk") {
+    auto r = redis::parse("$-1\r\n");
+    REQUIRE(r.has_value());
+    REQUIRE(std::holds_alternative<redis::RNull>(r->value.v));
+}
+
+TEST_CASE("array") {
+    auto r = redis::parse("*2\r\n$3\r\nSET\r\n$3\r\nfoo\r\n");
+    REQUIRE(r.has_value());
+    auto* arr = std::get_if<redis::RArray>(&r->value.v);
+    REQUIRE(arr); REQUIRE(arr->size() == 2);
+}
+
+TEST_CASE("incomplete") {
+    REQUIRE_FALSE(redis::parse("$5\r\nhel").has_value());
+    REQUIRE_FALSE(redis::parse("*2\r\n$3\r\nSET").has_value());
+}
+
+TEST_CASE("integer") {
+    auto r = redis::parse(":42\r\n");
+    REQUIRE(r.has_value());
+    auto* n = std::get_if<long long>(&r->value.v);
+    REQUIRE(n); REQUIRE(*n == 42);
+}
+
+TEST_CASE("error") {
+    auto r = redis::parse("-ERR bad\r\n");
+    REQUIRE(r.has_value());
+    auto* e = std::get_if<redis::RError>(&r->value.v);
+    REQUIRE(e); REQUIRE(e->msg == "ERR bad");
+}
+
+TEST_CASE("serialize roundtrip") {
+    redis::RValue v = redis::RValue::bulk("hello world");
+    auto wire = redis::serialize(v);
+    auto back = redis::parse(wire);
+    REQUIRE(back.has_value());
+    auto* s = std::get_if<std::string>(&back->value.v);
+    REQUIRE(s); REQUIRE(*s == "hello world");
+}
+```
+
+## Benchmark
+
+```bash
+# Start myredis on a non-default port
+./build/myredis --port 6380 &
+
+# 100k SET operations, 50 concurrent connections
+redis-benchmark -p 6380 -n 100000 -c 50 -t set,get
+
+# Compare against real Redis
+redis-server --port 6381 --daemonize yes
+redis-benchmark -p 6381 -n 100000 -c 50 -t set,get
+```
+
+Expect `myredis` to be 3–5× slower than Redis for a few reasons:
+
+1. Redis uses an event loop (`ae.c`) with non-blocking I/O; ours is
+   blocking `select`.
+2. Redis has an inline buffer allocator; ours copies strings.
+3. Redis uses `sds` (simple dynamic strings) tuned for this workload.
+
+To close the gap, the single biggest win is switching to `epoll`/`kqueue`
+with non-blocking sockets and a proper event loop. That's an afternoon.
+
+## Man page
+
+```
+.TH MYREDIS 1 "2025" "1.0" "myredis manual"
+.SH NAME
+myredis \- minimal Redis-compatible in-memory data store
+.SH SYNOPSIS
+.B myredis
+[\-\-port PORT] [\-\-save FILE]
+.SH DESCRIPTION
+Accepts RESP commands on TCP and stores data in memory.
+Compatible with redis-cli and any RESP client library.
+.SH OPTIONS
+.TP
+.B \-\-port PORT
+Listen on PORT (default 6379).
+.TP
+.B \-\-save FILE
+RDB snapshot file (default dump.rdb).
+```
+
+## Packaging
+
+```cmake
+install(TARGETS myredis RUNTIME DESTINATION bin)
+install(FILES myredis.1 DESTINATION share/man/man1)
+```
+
+```bash
+cmake -S . -B release -DCMAKE_BUILD_TYPE=Release
+cmake --build release -j
+sudo cmake --install release
+myredis --port 6379 &
+redis-cli PING   # PONG
+```
+
+## CI
+
+```yaml
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y cmake g++ redis-tools
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: chmod +x tests/run.sh && ./tests/run.sh
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install cmake redis
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: chmod +x tests/run.sh && ./tests/run.sh
+```
+
+## Final checklist
+
+- [ ] PING / ECHO / QUIT respond correctly
+- [ ] String commands: SET GET DEL EXISTS INCR INCRBY APPEND STRLEN MSET MGET
+- [ ] List commands: LPUSH RPUSH LPOP RPOP LLEN LRANGE LINDEX
+- [ ] Hash commands: HSET HGET HGETALL HDEL HEXISTS HLEN HKEYS HVALS
+- [ ] Set commands: SADD SREM SMEMBERS SISMEMBER SCARD
+- [ ] TTL/expiry: EXPIRE PEXPIRE TTL PERSIST
+- [ ] Persistence: SAVE writes dump.rdb; server loads it on startup
+- [ ] INFO returns version + keyspace info
+- [ ] `tests/run.sh` passes against the real `redis-cli`
+- [ ] RESP unit tests pass (Catch2)
+- [ ] `redis-benchmark` numbers recorded in README
+- [ ] CI green on Linux + macOS
+
+## What you've built
+
+About 1000–1500 lines of C++. A Redis-compatible server that handles the
+five core data types, expires keys, and persists to disk — all in a
+single-threaded event loop. The real Redis is architecturally identical
+(same RESP, same data types, same RDB format) but optimized much further.
+The gap between your implementation and Redis mainline is now clear: it's
+engineering, not magic.
+
+## Where next
+
+- [Build Your Own Database](/projects/database) — Redis stores data in
+  memory; a real database adds durability, B-trees, SQL, and ACID
+  transactions.
+- [Build Your Own Web Server](/projects/webserver) — the `select` loop
+  here is the same I/O multiplexing pattern as in the webserver track.
+- [Build Your Own Shell](/projects/shell) — the RESP parser here is the
+  same kind of tokenizer as the shell's command parser.

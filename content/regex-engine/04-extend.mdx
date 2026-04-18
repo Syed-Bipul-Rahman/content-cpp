@@ -1,0 +1,305 @@
+---
+title: Extending — DFA, captures, replace, grep integration
+description: Subset construction DFA, capture groups with submatch tracking, replace, and swapping into mgrep.
+---
+
+# Extending rengine
+
+The NFA simulator is correct and O(n×m). This lesson adds three things that
+make the engine production-worthy: a compiled DFA for speed, capture-group
+tracking, and a `replace` API. The lesson closes by swapping our engine
+into `mgrep` from the grep track.
+
+## Subset construction: NFA → DFA
+
+Each DFA state is a *set* of NFA states. We build the DFA lazily:
+
+1. Start state = ε-closure of the NFA start state.
+2. For each DFA state and each possible input character, compute the set of
+   NFA states reachable by consuming that character, then taking ε-closure.
+3. That reachable set is the target DFA state. Create it if new.
+
+```cpp
+// src/dfa.hpp
+#pragma once
+#include "nfa.hpp"
+
+#include <set>
+#include <unordered_map>
+#include <vector>
+
+namespace re {
+
+struct DfaState {
+    std::unordered_map<int, int> trans;  // char -> dfa state index
+    bool accept{false};
+};
+
+class Dfa {
+public:
+    explicit Dfa(Nfa& nfa, int nfa_start);
+
+    // Returns true if the entire string matches.
+    bool full_match(std::string_view text) const;
+
+    // Returns length of longest match starting at pos, or -1.
+    int longest_match(std::string_view text, std::size_t pos) const;
+
+    std::size_t state_count() const { return states_.size(); }
+
+private:
+    std::vector<DfaState> states_;
+    int start_{0};
+
+    using NfaSet = std::set<int>;
+    std::unordered_map<std::size_t, int> set_to_dfa_;
+
+    void eps_close(NfaSet& s, const Nfa& nfa) const;
+    int get_or_create(const NfaSet& s, Nfa& nfa);
+    std::size_t set_hash(const NfaSet& s) const;
+};
+
+}
+```
+
+```cpp
+// src/dfa.cpp
+#include "dfa.hpp"
+#include <functional>
+#include <queue>
+
+namespace re {
+
+std::size_t Dfa::set_hash(const NfaSet& s) const {
+    std::size_t h = 0;
+    for (int x : s) h ^= std::hash<int>{}(x) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+}
+
+void Dfa::eps_close(NfaSet& s, const Nfa& nfa) const {
+    std::vector<int> stack(s.begin(), s.end());
+    while (!stack.empty()) {
+        int n = stack.back(); stack.pop_back();
+        const auto& st = nfa.state(static_cast<std::size_t>(n));
+        if (st.label == EPS || st.label == ANCHOR_BOL || st.label == ANCHOR_EOL) {
+            if (st.out1 >= 0 && s.insert(st.out1).second) stack.push_back(st.out1);
+            if (st.out2 >= 0 && s.insert(st.out2).second) stack.push_back(st.out2);
+        }
+    }
+}
+
+int Dfa::get_or_create(const NfaSet& s, Nfa& nfa) {
+    auto h = set_hash(s);
+    auto it = set_to_dfa_.find(h);
+    if (it != set_to_dfa_.end()) return it->second;
+    int id = static_cast<int>(states_.size());
+    set_to_dfa_[h] = id;
+    states_.push_back({});
+    bool acc = false;
+    for (int n : s) if (nfa.state(static_cast<std::size_t>(n)).accept) acc = true;
+    states_[id].accept = acc;
+    return id;
+}
+
+Dfa::Dfa(Nfa& nfa, int nfa_start) {
+    NfaSet start_set = {nfa_start};
+    eps_close(start_set, nfa);
+    start_ = get_or_create(start_set, nfa);
+
+    std::queue<std::pair<NfaSet, int>> work;
+    work.push({start_set, start_});
+
+    while (!work.empty()) {
+        auto [cur_set, dfa_id] = work.front(); work.pop();
+
+        // Collect all characters that can be consumed from this set.
+        std::set<int> labels;
+        for (int n : cur_set) {
+            int lbl = nfa.state(static_cast<std::size_t>(n)).label;
+            if (lbl >= 0) labels.insert(lbl);
+        }
+
+        for (int lbl : labels) {
+            NfaSet next;
+            for (int n : cur_set) {
+                const auto& st = nfa.state(static_cast<std::size_t>(n));
+                if (st.label == lbl && st.out1 >= 0) next.insert(st.out1);
+            }
+            eps_close(next, nfa);
+            if (next.empty()) continue;
+            int next_id = get_or_create(next, nfa);
+            states_[dfa_id].trans[lbl] = next_id;
+            // Only enqueue if this is a new DFA state.
+            if (next_id == static_cast<int>(states_.size()) - 1)
+                work.push({next, next_id});
+        }
+    }
+}
+
+bool Dfa::full_match(std::string_view text) const {
+    int s = start_;
+    for (char c : text) {
+        auto it = states_[s].trans.find(static_cast<unsigned char>(c));
+        if (it == states_[s].trans.end()) return false;
+        s = it->second;
+    }
+    return states_[s].accept;
+}
+
+int Dfa::longest_match(std::string_view text, std::size_t pos) const {
+    int s = start_;
+    int last_accept = states_[s].accept ? static_cast<int>(pos) : -1;
+    for (std::size_t i = pos; i < text.size(); ++i) {
+        auto it = states_[s].trans.find(static_cast<unsigned char>(text[i]));
+        if (it == states_[s].trans.end()) break;
+        s = it->second;
+        if (states_[s].accept) last_accept = static_cast<int>(i + 1);
+    }
+    return last_accept;
+}
+
+}
+```
+
+Expose a `DfaMatcher` convenience wrapper in `match.hpp` / `match.cpp` that
+builds the DFA once and uses `longest_match` for search. On patterns without
+anchors or character classes (which we skipped in subset construction above),
+this should be measurably faster.
+
+## Capture groups
+
+Tracking captures requires propagating per-thread state through the NFA
+simulation. The standard technique: each entry in the state set carries its
+own capture array.
+
+```cpp
+struct CaptureVec {
+    // 2 * num_groups entries: [start0, end0, start1, end1, ...]
+    // -1 = unset
+    std::vector<int> v;
+};
+
+struct ThreadState {
+    int        nfa_state;
+    CaptureVec caps;
+};
+```
+
+Replace `std::vector<int> cur` in the simulator with
+`std::vector<ThreadState> cur`. When following an ε transition that enters
+or exits a group, update the capture in the thread's copy.
+
+This makes the per-step work O(m × g) instead of O(m), where g is the
+number of groups. For most real patterns (few groups, short input) this is
+negligible.
+
+### API
+
+```cpp
+struct MatchResult {
+    std::size_t start;
+    std::size_t end;
+    // sub[0] = whole match, sub[1] = group 1, ...
+    std::vector<std::pair<int,int>> sub;
+};
+
+std::optional<MatchResult> find_with_captures(std::string_view text) const;
+```
+
+## Replace
+
+```cpp
+// src/match.hpp additions:
+std::string replace(std::string_view text,
+                    std::string_view replacement) const;
+
+std::string replace_all(std::string_view text,
+                        std::string_view replacement) const;
+```
+
+Replacement syntax: `$0` = whole match, `$1` = group 1, etc.
+
+```cpp
+std::string Matcher::replace_all(std::string_view text,
+                                  std::string_view repl) const {
+    std::string out;
+    std::size_t i = 0;
+    while (i <= text.size()) {
+        std::size_t end;
+        if (simulate(text, i, end)) {
+            out.append(text.data(), i);
+            // apply replacement (simple: no group references)
+            out.append(repl.data(), repl.size());
+            i = end > i ? end : end + 1;
+        } else {
+            if (i < text.size()) out.push_back(text[i]);
+            ++i;
+        }
+    }
+    return out;
+}
+```
+
+For group references in the replacement string, scan for `$n` and
+substitute from the `CaptureVec` of the match.
+
+## Plugging into mgrep
+
+The `mgrep` matcher has a clean interface (lesson 03):
+
+```cpp
+class Matcher {
+    bool find_all(std::string_view line, std::vector<Range>& out) const;
+};
+```
+
+Replace the `std::regex` backend with our NFA:
+
+```cpp
+// src/matcher.cpp — re-engine version
+#include "matcher.hpp"
+#include "match.hpp"   // our engine
+
+namespace mgrep {
+
+Matcher::Matcher(const Args& a) : re_{a.pattern} {}
+
+bool Matcher::find_all(std::string_view line, std::vector<Range>& out) const {
+    out.clear();
+    for (const auto& m : re_.find_all(line)) {
+        out.push_back({m.start, m.end});
+    }
+    return !out.empty();
+}
+
+}
+```
+
+Everything else in mgrep stays unchanged. Run `mgrep`'s test suite to
+verify the swap works.
+
+## Benchmark
+
+Construct a pathological pattern for backtracking engines:
+
+```bash
+python3 -c "print('a'*30)" > /tmp/evil.txt
+for n in 10 20 30; do
+  PAT=$(python3 -c "print('(a?)'*$n + 'a'*$n)")
+  time echo "aaaaaaaaaaaa" | grep -E "$PAT" 2>/dev/null || true
+  time ./build/rengine "$PAT" "$(python3 -c "print('a'*$n")"
+done
+```
+
+For n=30, `grep -E` (backtracking on many platforms) may take seconds.
+Our NFA simulation is linear in the length of the input.
+
+## Exercises
+
+1. Handle `ANY` states in the DFA subset construction (they match any
+   character — add them as transitions for every character code 0–255).
+2. Implement group references in the replacement string (`$1`, `$2`).
+3. Add a `--jit` flag that compiles the DFA transitions to a jump table at
+   startup (no actual JIT — just a `switch` table over states).
+4. Measure memory usage (DFA states) for a pattern with many alternations.
+   At what point does the exponential blowup become a problem?

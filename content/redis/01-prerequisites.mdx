@@ -1,0 +1,123 @@
+---
+title: Prerequisites & mental model
+description: What Redis is at the protocol level, the RESP wire format, and the in-memory data model.
+---
+
+# Prerequisites & mental model
+
+Redis looks like magic until you realize it's a hash table with a network
+socket in front of it. The client sends a command over TCP, the server
+looks up a key, and sends back a value. There is no query planner, no
+schema, no joins. That's why it's fast.
+
+## What you should already know
+
+- C++ Fundamentals through lesson 21: sockets (from the webserver track),
+  `std::unordered_map`, `std::variant`, file I/O.
+- TCP fundamentals: the server `accept`s connections, reads bytes, writes
+  bytes. Covered in the webserver track.
+- Comfort with the command line; you'll test against the real `redis-cli`.
+
+## RESP — the Redis Serialization Protocol
+
+Every byte on the wire between Redis client and server is RESP. It's
+deliberately simple:
+
+| First byte | Type | Example |
+| --- | --- | --- |
+| `+` | Simple String | `+OK\r\n` |
+| `-` | Error | `-ERR unknown command\r\n` |
+| `:` | Integer | `:42\r\n` |
+| `$` | Bulk String | `$5\r\nhello\r\n` |
+| `*` | Array | `*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n` |
+
+A client sends commands as a RESP Array of Bulk Strings:
+
+```
+*3\r\n
+$3\r\n
+SET\r\n
+$3\r\n
+key\r\n
+$5\r\n
+value\r\n
+```
+
+The server responds with any RESP type.
+
+Null bulk string (absence of a value): `$-1\r\n`
+
+That's the entire protocol. You can implement a RESP parser in an afternoon.
+
+## The data model
+
+Redis stores a flat namespace of `key → value` pairs. The value can be:
+
+| Type | C++ equivalent | Commands |
+| --- | --- | --- |
+| String | `std::string` | GET, SET, INCR, APPEND |
+| List | `std::deque<string>` | LPUSH, RPUSH, LPOP, RPOP, LRANGE |
+| Hash | `unordered_map<string,string>` | HSET, HGET, HGETALL |
+| Set | `unordered_set<string>` | SADD, SREM, SMEMBERS, SISMEMBER |
+| Sorted Set | `map<double,string>` | ZADD, ZRANGE, ZSCORE |
+
+We'll implement String, List, Hash, and Set. Sorted sets are an exercise.
+
+## Persistence
+
+Redis has two persistence modes:
+
+- **RDB** — periodic snapshots of the whole dataset to a `.rdb` file.
+- **AOF** — append every write command to a log; replay on restart.
+
+We'll implement RDB in lesson 04 and AOF as an exercise.
+
+## What we'll build
+
+| Lesson | Builds |
+| --- | --- |
+| 02 | Scaffold, RESP parser/serializer, TCP server loop |
+| 03 | String and List commands, pipelining, inline commands |
+| 04 | Hash, Set, TTL/expiry, RDB persistence, INFO |
+| 05 | Tests against real `redis-cli`, packaging, CI |
+
+About 1000–1500 lines of C++. The result is a server that passes a
+`redis-cli` smoke test and can be used as a drop-in for simple caching
+workloads.
+
+## The challenge: trace a SET/GET by hand
+
+Open two terminals:
+
+```bash
+# Terminal 1
+redis-server --port 6380
+
+# Terminal 2
+nc localhost 6380
+*3
+$3
+SET
+$3
+foo
+$3
+bar
+```
+
+You'll see `+OK\r\n` come back. Then:
+
+```
+*2
+$3
+GET
+$3
+foo
+```
+
+You'll see `$3\r\nbar\r\n`. You just spoke RESP by hand. Your server
+needs to do exactly the same parsing and response.
+
+## Next
+
+Project scaffold: directory layout, CMake, the RESP parser, and a TCP
+server that echoes commands back as parsed arrays.

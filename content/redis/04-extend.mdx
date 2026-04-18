@@ -1,0 +1,460 @@
+---
+title: Extending — Hash, Set, TTL, RDB persistence, INFO
+description: Hash and Set commands, key expiry, RDB snapshots, and the INFO command.
+---
+
+# Extending myredis
+
+This lesson completes the data model with Hash and Set commands, adds TTL
+and expiry, implements RDB persistence so data survives restarts, and
+adds `INFO` for observability.
+
+## Hash commands
+
+Hashes map field names to string values within a single key.
+
+Add to `store.cpp`:
+
+```cpp
+std::string Store::cmd_hset(const std::vector<std::string_view>& args) {
+    if (args.size() < 3 || args.size() % 2 == 0)
+        return err("wrong number of arguments");
+    auto key = std::string{args[0]};
+    auto* e  = get(key);
+    if (!e) { set(key, {HashVal{}, {}}); e = get(key); }
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    long long added = 0;
+    for (std::size_t i = 1; i < args.size(); i += 2) {
+        auto [_, ins] = hv->data.emplace(std::string{args[i]},
+                                          std::string{args[i+1]});
+        if (!ins) hv->data[std::string{args[i]}] = std::string{args[i+1]};
+        else ++added;
+    }
+    return integer_resp(added);
+}
+
+std::string Store::cmd_hget(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return null_bulk();
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    auto it = hv->data.find(std::string{args[1]});
+    if (it == hv->data.end()) return null_bulk();
+    return bulk_string(it->second);
+}
+
+std::string Store::cmd_hgetall(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return "*0\r\n";
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    std::vector<std::string> items;
+    for (const auto& [k, v] : hv->data) { items.push_back(k); items.push_back(v); }
+    return array_resp(items);
+}
+
+std::string Store::cmd_hdel(const std::vector<std::string_view>& args) {
+    if (args.size() < 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    long long n = 0;
+    for (std::size_t i = 1; i < args.size(); ++i)
+        n += hv->data.erase(std::string{args[i]});
+    return integer_resp(n);
+}
+
+std::string Store::cmd_hexists(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    return integer_resp(hv->data.count(std::string{args[1]}));
+}
+
+std::string Store::cmd_hlen(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    return integer_resp(static_cast<long long>(hv->data.size()));
+}
+
+std::string Store::cmd_hkeys(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return "*0\r\n";
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    std::vector<std::string> out;
+    for (const auto& [k, _] : hv->data) out.push_back(k);
+    return array_resp(out);
+}
+
+std::string Store::cmd_hvals(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return "*0\r\n";
+    auto* hv = std::get_if<HashVal>(&e->val);
+    if (!hv) return err("WRONGTYPE");
+    std::vector<std::string> out;
+    for (const auto& [_, v] : hv->data) out.push_back(v);
+    return array_resp(out);
+}
+```
+
+## Set commands
+
+Sets hold unique string members.
+
+```cpp
+std::string Store::cmd_sadd(const std::vector<std::string_view>& args) {
+    if (args.size() < 2) return err("wrong number of arguments");
+    auto key = std::string{args[0]};
+    auto* e  = get(key);
+    if (!e) { set(key, {SetVal{}, {}}); e = get(key); }
+    auto* sv = std::get_if<SetVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    long long added = 0;
+    for (std::size_t i = 1; i < args.size(); ++i)
+        added += sv->data.emplace(std::string{args[i]}, 1).second;
+    return integer_resp(added);
+}
+
+std::string Store::cmd_srem(const std::vector<std::string_view>& args) {
+    if (args.size() < 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* sv = std::get_if<SetVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    long long n = 0;
+    for (std::size_t i = 1; i < args.size(); ++i)
+        n += sv->data.erase(std::string{args[i]});
+    return integer_resp(n);
+}
+
+std::string Store::cmd_smembers(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return "*0\r\n";
+    auto* sv = std::get_if<SetVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    std::vector<std::string> out;
+    for (const auto& [k, _] : sv->data) out.push_back(k);
+    return array_resp(out);
+}
+
+std::string Store::cmd_sismember(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* sv = std::get_if<SetVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    return integer_resp(sv->data.count(std::string{args[1]}));
+}
+
+std::string Store::cmd_scard(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    auto* sv = std::get_if<SetVal>(&e->val);
+    if (!sv) return err("WRONGTYPE");
+    return integer_resp(static_cast<long long>(sv->data.size()));
+}
+```
+
+## TTL and expiry
+
+The `expires_at` field is already in `Entry`. Wire up the commands:
+
+```cpp
+std::string Store::cmd_expire(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    long long secs = to_ll(args[1]);
+    e->expires_at = Clock::now() + std::chrono::seconds{secs};
+    return integer_resp(1);
+}
+
+std::string Store::cmd_pexpire(const std::vector<std::string_view>& args) {
+    if (args.size() != 2) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(0);
+    e->expires_at = Clock::now() + std::chrono::milliseconds{to_ll(args[1])};
+    return integer_resp(1);
+}
+
+std::string Store::cmd_ttl(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e) return integer_resp(-2);   // key does not exist
+    if (!e->expires_at) return integer_resp(-1);  // no expiry
+    auto rem = std::chrono::duration_cast<std::chrono::seconds>(
+                   *e->expires_at - Clock::now()).count();
+    return integer_resp(rem < 0 ? 0 : rem);
+}
+
+std::string Store::cmd_persist(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) return err("wrong number of arguments");
+    auto* e = get(std::string{args[0]});
+    if (!e || !e->expires_at) return integer_resp(0);
+    e->expires_at.reset();
+    return integer_resp(1);
+}
+```
+
+### Active expiry loop
+
+Real Redis also runs a background timer that evicts expired keys even when
+they aren't accessed. Add to `server.cpp`, inside the select loop:
+
+```cpp
+// Active expiry every ~100 ms
+static auto last_evict = Clock::now();
+if (Clock::now() - last_evict > std::chrono::milliseconds{100}) {
+    store.evict_expired();
+    last_evict = Clock::now();
+}
+```
+
+```cpp
+// store.cpp
+void Store::evict_expired() {
+    for (auto it = data_.begin(); it != data_.end(); ) {
+        if (it->second.expired()) it = data_.erase(it);
+        else ++it;
+    }
+}
+```
+
+## RDB persistence
+
+RDB is a binary snapshot of all keys at a point in time. Our format is a
+simplified version of the real Redis RDB format:
+
+```
+Header: "MYREDIS0001\n"
+For each key:
+  1 byte  type  (0=string 1=list 2=hash 3=set)
+  4 bytes key length (little-endian)
+  key bytes
+  8 bytes expiry unix ms (0 = no expiry)
+  type-specific payload
+Footer: 0xFF
+```
+
+```cpp
+// src/rdb.hpp
+#pragma once
+#include "store.hpp"
+#include <string>
+
+namespace redis {
+void rdb_save(const Store& store, const std::string& path);
+void rdb_load(Store& store,       const std::string& path);
+}
+```
+
+```cpp
+// src/rdb.cpp
+#include "rdb.hpp"
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+
+namespace redis {
+
+static void write_u32(std::ostream& o, std::uint32_t v) {
+    o.write(reinterpret_cast<const char*>(&v), 4);
+}
+static void write_u64(std::ostream& o, std::uint64_t v) {
+    o.write(reinterpret_cast<const char*>(&v), 8);
+}
+static void write_str(std::ostream& o, const std::string& s) {
+    write_u32(o, static_cast<std::uint32_t>(s.size()));
+    o.write(s.data(), static_cast<std::streamsize>(s.size()));
+}
+
+static std::uint32_t read_u32(std::istream& i) {
+    std::uint32_t v; i.read(reinterpret_cast<char*>(&v), 4); return v;
+}
+static std::uint64_t read_u64(std::istream& i) {
+    std::uint64_t v; i.read(reinterpret_cast<char*>(&v), 8); return v;
+}
+static std::string read_str(std::istream& i) {
+    auto len = read_u32(i);
+    std::string s(len, '\0');
+    i.read(s.data(), len);
+    return s;
+}
+
+void rdb_save(const Store& store, const std::string& path) {
+    std::ofstream f{path, std::ios::binary};
+    f << "MYREDIS0001\n";
+    for (const auto& [key, entry] : store.entries()) {
+        if (entry.expired()) continue;
+        std::uint8_t type = std::visit([](const auto& v) -> std::uint8_t {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, StringVal>) return 0;
+            if constexpr (std::is_same_v<T, ListVal>)   return 1;
+            if constexpr (std::is_same_v<T, HashVal>)   return 2;
+            if constexpr (std::is_same_v<T, SetVal>)    return 3;
+            return 255;
+        }, entry.val);
+        f.write(reinterpret_cast<const char*>(&type), 1);
+        write_str(f, key);
+
+        std::uint64_t exp_ms = 0;
+        if (entry.expires_at) {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          entry.expires_at->time_since_epoch()).count();
+            exp_ms = static_cast<std::uint64_t>(ms);
+        }
+        write_u64(f, exp_ms);
+
+        std::visit([&](const auto& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, StringVal>) {
+                write_str(f, v.data);
+            } else if constexpr (std::is_same_v<T, ListVal>) {
+                write_u32(f, static_cast<std::uint32_t>(v.data.size()));
+                for (const auto& s : v.data) write_str(f, s);
+            } else if constexpr (std::is_same_v<T, HashVal>) {
+                write_u32(f, static_cast<std::uint32_t>(v.data.size()));
+                for (const auto& [k, val] : v.data) { write_str(f, k); write_str(f, val); }
+            } else if constexpr (std::is_same_v<T, SetVal>) {
+                write_u32(f, static_cast<std::uint32_t>(v.data.size()));
+                for (const auto& [k, _] : v.data) write_str(f, k);
+            }
+        }, entry.val);
+    }
+    std::uint8_t eof = 0xFF;
+    f.write(reinterpret_cast<const char*>(&eof), 1);
+}
+
+void rdb_load(Store& store, const std::string& path) {
+    std::ifstream f{path, std::ios::binary};
+    if (!f) return;
+    std::string hdr(12, '\0'); f.read(hdr.data(), 12);
+    if (hdr.substr(0, 11) != "MYREDIS0001") throw std::runtime_error("bad RDB header");
+
+    while (f) {
+        std::uint8_t type; f.read(reinterpret_cast<char*>(&type), 1);
+        if (!f || type == 0xFF) break;
+        auto key    = read_str(f);
+        auto exp_ms = read_u64(f);
+
+        std::optional<TimePoint> exp;
+        if (exp_ms) {
+            exp = TimePoint{std::chrono::milliseconds{exp_ms}};
+        }
+
+        switch (type) {
+        case 0: { auto s = read_str(f); store.set(key, {StringVal{s}, exp}); break; }
+        case 1: {
+            ListVal lv;
+            auto n = read_u32(f);
+            for (std::uint32_t i = 0; i < n; ++i) lv.data.push_back(read_str(f));
+            store.set(key, {std::move(lv), exp});
+            break;
+        }
+        case 2: {
+            HashVal hv;
+            auto n = read_u32(f);
+            for (std::uint32_t i = 0; i < n; ++i) {
+                auto k = read_str(f); auto v = read_str(f); hv.data[k] = v;
+            }
+            store.set(key, {std::move(hv), exp});
+            break;
+        }
+        case 3: {
+            SetVal sv;
+            auto n = read_u32(f);
+            for (std::uint32_t i = 0; i < n; ++i) sv.data[read_str(f)] = 1;
+            store.set(key, {std::move(sv), exp});
+            break;
+        }
+        }
+    }
+}
+
+}
+```
+
+Add `SAVE` and `BGSAVE` commands:
+
+```cpp
+std::string Store::cmd_save(const std::vector<std::string_view>&) {
+    rdb_save(*this, "dump.rdb");
+    return ok();
+}
+```
+
+Load on startup in `main.cpp`:
+
+```cpp
+redis::rdb_load(store, "dump.rdb");
+```
+
+## INFO command
+
+```cpp
+std::string Store::cmd_info(const std::vector<std::string_view>&) {
+    std::ostringstream os;
+    os << "# Server\r\n";
+    os << "redis_version:0.1.0\r\n";
+    os << "executable:myredis\r\n";
+    os << "# Keyspace\r\n";
+    long long alive = 0;
+    for (const auto& [_, e] : data_) if (!e.expired()) ++alive;
+    os << "db0:keys=" << alive << ",expires=0\r\n";
+    auto body = os.str();
+    return "$" + std::to_string(body.size()) + "\r\n" + body + "\r\n";
+}
+```
+
+## Try it
+
+```bash
+cmake --build build
+./build/myredis --port 6380 &
+
+redis-cli -p 6380 HSET user:1 name Alice age 30
+redis-cli -p 6380 HGETALL user:1
+# 1) "name"
+# 2) "Alice"
+# 3) "age"
+# 4) "30"
+
+redis-cli -p 6380 SADD fruits apple banana cherry
+redis-cli -p 6380 SISMEMBER fruits banana
+# (integer) 1
+
+redis-cli -p 6380 SET tmp "gone soon"
+redis-cli -p 6380 EXPIRE tmp 5
+redis-cli -p 6380 TTL tmp
+# (integer) 5
+sleep 6
+redis-cli -p 6380 GET tmp
+# (nil)
+
+redis-cli -p 6380 SAVE
+# OK
+# -> creates dump.rdb
+```
+
+## Exercises
+
+1. Implement `SUNION`, `SINTER`, `SDIFF` for set algebra.
+2. Implement `HINCRBY key field increment`.
+3. Implement `OBJECT ENCODING key` that reports whether a list is stored
+   as a deque or a ziplist (our deque is always "linkedlist").
+4. Implement a proper AOF: on every write command, append its serialized
+   RESP to `appendonly.aof`. On startup, replay it.

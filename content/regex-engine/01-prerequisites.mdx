@@ -1,0 +1,142 @@
+---
+title: Prerequisites & mental model
+description: Finite automata theory, the NFA/DFA distinction, and why regex engines are the way they are.
+---
+
+# Prerequisites & mental model
+
+A regular expression engine is one of the most educational things you can
+build. It touches formal language theory, graph traversal, dynamic
+programming, and careful string manipulation — all in a few hundred lines.
+
+## What you should already know
+
+- C++ Fundamentals through lesson 21, especially classes and recursion.
+- Basic regex syntax at the user level: `.`, `*`, `+`, `?`, `|`, `()`,
+  `[abc]`, `\d`, anchors.
+- Comfort reading a recursive algorithm.
+
+## The two mental models
+
+### NFA — non-deterministic finite automaton
+
+An NFA is a graph where:
+
+- Nodes are **states**.
+- Edges are **transitions** labelled with a character (or ε, the empty string).
+- One state is the **start**.
+- One or more states are **accepting**.
+
+A string matches if there exists *any* path from start to an accepting state
+that consumes the string. An NFA can be in multiple states simultaneously.
+
+```
+Pattern:  a(b|c)*d
+NFA:
+  S0 --a--> S1 --ε--> S2 --b--> S3 --ε--> S4
+                  |                          |
+                  +-------c-----> S5 --ε---->+--ε--> S4 --d--> ACCEPT
+                  ^                                   |
+                  +<--------------ε-------------------+
+```
+
+Key insight: **ε-closures**. Before consuming any character, follow all ε
+transitions. The current "state" of the NFA is always a *set* of states.
+
+### DFA — deterministic finite automaton
+
+A DFA has no ε transitions and no ambiguity: given a state and a character,
+there is exactly one next state (or none, meaning reject). DFAs are faster
+to execute but expensive to build.
+
+**The relationship**: every NFA can be converted to a DFA via the *subset
+construction* (powerset construction). Each DFA state corresponds to a
+*set* of NFA states. A DFA might have exponentially more states than the
+equivalent NFA, but in practice it's often manageable.
+
+## What we'll build
+
+We use the **Thompson NFA** approach:
+
+1. Parse the regex into an AST.
+2. Walk the AST, constructing NFA fragments (Thompson construction).
+3. Match by simulating the NFA with ε-closure + character transitions.
+
+This is exactly what Ken Thompson described in his 1968 paper and what
+early `grep` used. It has the crucial property that matching is **O(n × m)**
+worst case (n = input length, m = pattern states) — unlike backtracking
+engines, which can be exponential.
+
+For completeness, lesson 04 also builds a DFA from the NFA via subset
+construction.
+
+## Why backtracking engines exist
+
+Perl-compatible regex (PCRE) supports backreferences (`\1`) and lookahead/
+lookbehind, which require the ability to capture substrings and backtrack.
+These features are not regular (they can't be expressed as a finite
+automaton), so PCRE uses a backtracking NFA. This is why `(a+)+b` against
+`aaaaaaaaaaaaaac` can hang in PCRE but not in a Thompson engine.
+
+We'll support capturing groups for convenience, but our core matching path
+stays Thompson.
+
+## The high-level flow
+
+```
+regex string
+    │
+    ▼
+  Lexer  →  tokens
+    │
+    ▼
+  Parser →  AST (recursive descent)
+    │
+    ▼
+  Thompson construction  →  NFA
+    │
+    ▼
+  NFA simulation  →  match / no match
+    │
+    (optional)
+  Subset construction  →  DFA
+    │
+    ▼
+  DFA simulation  →  match / no match
+```
+
+## Supported syntax
+
+| Syntax | Meaning |
+| --- | --- |
+| `abc` | literal characters |
+| `.` | any character except newline |
+| `*` | zero or more of previous |
+| `+` | one or more of previous |
+| `?` | zero or one of previous |
+| `\|` | alternation |
+| `(…)` | grouping / capture |
+| `[abc]` | character class |
+| `[^abc]` | negated character class |
+| `[a-z]` | range in class |
+| `^` `$` | anchors |
+| `\d \w \s` | shorthand classes |
+| `{n}` `{n,m}` | counted repetition |
+
+We will deliberately not implement lookahead or backreferences — those
+would require a backtracking engine and double the code.
+
+## The challenge: trace an NFA by hand
+
+Take the pattern `a(b|c)+`:
+
+1. Draw the NFA states and ε transitions.
+2. Trace the string `"abc"` through it, tracking the active state set.
+3. Verify `"ac"` matches and `"a"` does not.
+
+If you can do this on paper, the code almost writes itself.
+
+## Next
+
+Project scaffold: directory layout, CMake, the lexer, and a complete
+recursive-descent parser that produces an AST.

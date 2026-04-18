@@ -1,0 +1,496 @@
+---
+title: Project scaffold — RESP parser, TCP server, command dispatch
+description: Directory layout, CMake, the RESP wire protocol, and a server that accepts connections and echoes parsed commands.
+---
+
+# Project scaffold
+
+By the end of this lesson, `myredis` listens on port 6379, accepts
+connections, parses RESP arrays, and responds with `+PONG\r\n` to `PING`.
+Real `redis-cli` can connect to it.
+
+## Directory layout
+
+```
+myredis/
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── resp.hpp/.cpp       # RESP parser + serializer
+│   ├── server.hpp/.cpp     # TCP accept loop
+│   ├── client.hpp/.cpp     # per-connection state
+│   ├── store.hpp/.cpp      # in-memory key-value store
+│   └── commands.hpp/.cpp   # command dispatch
+└── tests/
+    └── run.sh
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(myredis CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+add_executable(myredis
+    src/main.cpp
+    src/resp.cpp
+    src/server.cpp
+    src/client.cpp
+    src/store.cpp
+    src/commands.cpp
+)
+target_include_directories(myredis PRIVATE src)
+```
+
+## RESP parser
+
+### src/resp.hpp
+
+```cpp
+#pragma once
+#include <string>
+#include <variant>
+#include <vector>
+#include <optional>
+
+namespace redis {
+
+// A parsed RESP value.
+struct RNull {};
+struct RError { std::string msg; };
+
+struct RValue;
+using RArray = std::vector<RValue>;
+
+struct RValue {
+    std::variant<
+        RNull,
+        bool,           // will use for integers (stored as long long below)
+        long long,
+        std::string,
+        RError,
+        RArray
+    > v;
+
+    static RValue null()                    { RValue r; r.v = RNull{}; return r; }
+    static RValue integer(long long n)      { RValue r; r.v = n; return r; }
+    static RValue simple(std::string s)     { RValue r; r.v = std::move(s); return r; }
+    static RValue bulk(std::string s)       { return simple(std::move(s)); }
+    static RValue error(std::string msg)    { RValue r; r.v = RError{std::move(msg)}; return r; }
+    static RValue array(RArray a)           { RValue r; r.v = std::move(a); return r; }
+};
+
+// Parse result: value + bytes consumed. Returns nullopt if incomplete.
+struct ParseResult {
+    RValue      value;
+    std::size_t consumed;
+};
+
+std::optional<ParseResult> parse(std::string_view buf);
+
+// Serialize a value back to RESP wire format.
+std::string serialize(const RValue& v);
+
+// Convenience serializers used by command handlers.
+std::string ok();
+std::string err(std::string_view msg);
+std::string bulk_string(std::string_view s);
+std::string null_bulk();
+std::string integer_resp(long long n);
+std::string array_resp(const std::vector<std::string>& items);
+
+}
+```
+
+### src/resp.cpp
+
+```cpp
+#include "resp.hpp"
+#include <charconv>
+#include <stdexcept>
+#include <sstream>
+
+namespace redis {
+
+// Find the next CRLF, return its position or npos.
+static std::size_t find_crlf(std::string_view s, std::size_t from = 0) {
+    for (std::size_t i = from; i + 1 < s.size(); ++i)
+        if (s[i] == '\r' && s[i+1] == '\n') return i;
+    return std::string_view::npos;
+}
+
+static long long parse_ll(std::string_view s) {
+    long long n = 0;
+    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), n);
+    if (ec != std::errc{}) throw std::runtime_error("bad integer");
+    return n;
+}
+
+std::optional<ParseResult> parse(std::string_view buf) {
+    if (buf.empty()) return std::nullopt;
+
+    char type = buf[0];
+    auto crlf = find_crlf(buf, 1);
+    if (crlf == std::string_view::npos) return std::nullopt;
+
+    auto line = buf.substr(1, crlf - 1);
+    std::size_t after_line = crlf + 2;
+
+    switch (type) {
+    case '+': return ParseResult{RValue::simple(std::string{line}), after_line};
+    case '-': return ParseResult{RValue::error(std::string{line}),  after_line};
+    case ':': return ParseResult{RValue::integer(parse_ll(line)),   after_line};
+
+    case '$': {
+        long long len = parse_ll(line);
+        if (len < 0) return ParseResult{RValue::null(), after_line};
+        if (after_line + static_cast<std::size_t>(len) + 2 > buf.size())
+            return std::nullopt;
+        auto data = buf.substr(after_line, len);
+        return ParseResult{RValue::bulk(std::string{data}),
+                           after_line + len + 2};
+    }
+
+    case '*': {
+        long long count = parse_ll(line);
+        if (count < 0) return ParseResult{RValue::null(), after_line};
+        RArray arr;
+        std::size_t pos = after_line;
+        for (long long i = 0; i < count; ++i) {
+            auto sub = parse(buf.substr(pos));
+            if (!sub) return std::nullopt;
+            arr.push_back(std::move(sub->value));
+            pos += sub->consumed;
+        }
+        return ParseResult{RValue::array(std::move(arr)), pos};
+    }
+
+    default:
+        throw std::runtime_error(std::string{"unknown RESP type: "} + type);
+    }
+}
+
+std::string serialize(const RValue& v) {
+    return std::visit([](const auto& x) -> std::string {
+        using T = std::decay_t<decltype(x)>;
+        if constexpr (std::is_same_v<T, RNull>)
+            return "$-1\r\n";
+        else if constexpr (std::is_same_v<T, long long>)
+            return ":" + std::to_string(x) + "\r\n";
+        else if constexpr (std::is_same_v<T, std::string>)
+            return "$" + std::to_string(x.size()) + "\r\n" + x + "\r\n";
+        else if constexpr (std::is_same_v<T, RError>)
+            return "-" + x.msg + "\r\n";
+        else if constexpr (std::is_same_v<T, RArray>) {
+            std::string out = "*" + std::to_string(x.size()) + "\r\n";
+            for (const auto& e : x) out += serialize(e);
+            return out;
+        }
+        return "$-1\r\n";
+    }, v.v);
+}
+
+std::string ok()                        { return "+OK\r\n"; }
+std::string err(std::string_view msg)   { return "-ERR " + std::string{msg} + "\r\n"; }
+std::string null_bulk()                 { return "$-1\r\n"; }
+std::string integer_resp(long long n)   { return ":" + std::to_string(n) + "\r\n"; }
+
+std::string bulk_string(std::string_view s) {
+    return "$" + std::to_string(s.size()) + "\r\n" + std::string{s} + "\r\n";
+}
+
+std::string array_resp(const std::vector<std::string>& items) {
+    std::string out = "*" + std::to_string(items.size()) + "\r\n";
+    for (const auto& s : items) out += bulk_string(s);
+    return out;
+}
+
+}
+```
+
+## Per-client connection
+
+### src/client.hpp
+
+```cpp
+#pragma once
+#include <string>
+
+namespace redis {
+
+class Store;
+
+struct Client {
+    int         fd;
+    std::string rbuf;   // receive buffer
+    std::string wbuf;   // write buffer (queued responses)
+
+    // Process as many complete RESP messages from rbuf as possible.
+    // Appends responses to wbuf.
+    void process(Store& store);
+};
+
+}
+```
+
+### src/client.cpp
+
+```cpp
+#include "client.hpp"
+#include "commands.hpp"
+#include "resp.hpp"
+#include "store.hpp"
+
+namespace redis {
+
+void Client::process(Store& store) {
+    while (true) {
+        // Try inline command (plain text, e.g. from nc/telnet).
+        // If starts with '*', treat as RESP array.
+        if (rbuf.empty()) break;
+
+        std::optional<ParseResult> pr;
+        if (rbuf[0] == '*' || rbuf[0] == '$' ||
+            rbuf[0] == '+' || rbuf[0] == '-' || rbuf[0] == ':') {
+            pr = parse(rbuf);
+        } else {
+            // Inline: "PING\r\n" or "SET key val\r\n"
+            auto crlf = rbuf.find("\r\n");
+            if (crlf == std::string::npos) break;
+            std::string line = rbuf.substr(0, crlf);
+            rbuf.erase(0, crlf + 2);
+            // Tokenize and fake an array.
+            RArray arr;
+            std::istringstream ss{line};
+            std::string tok;
+            while (ss >> tok) arr.push_back(RValue::bulk(tok));
+            if (arr.empty()) continue;
+            wbuf += dispatch(RValue::array(std::move(arr)), store);
+            continue;
+        }
+
+        if (!pr) break;  // incomplete
+        rbuf.erase(0, pr->consumed);
+        wbuf += dispatch(pr->value, store);
+    }
+}
+
+}
+```
+
+## Command dispatch
+
+### src/commands.hpp
+
+```cpp
+#pragma once
+#include "resp.hpp"
+#include <string>
+
+namespace redis {
+
+class Store;
+
+// Dispatch a parsed RESP value (expected to be an Array of bulk strings).
+// Returns the serialized response.
+std::string dispatch(const RValue& cmd, Store& store);
+
+}
+```
+
+### src/commands.cpp (bootstrap)
+
+```cpp
+#include "commands.hpp"
+#include "resp.hpp"
+#include "store.hpp"
+
+#include <algorithm>
+#include <string>
+
+namespace redis {
+
+static std::string to_upper(std::string s) {
+    for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string dispatch(const RValue& cmd, Store& store) {
+    const RArray* arr = std::get_if<RArray>(&cmd.v);
+    if (!arr || arr->empty()) return err("empty command");
+
+    const std::string* name_ptr = std::get_if<std::string>(&(*arr)[0].v);
+    if (!name_ptr) return err("command name must be bulk string");
+
+    std::string name = to_upper(*name_ptr);
+
+    // Gather arguments.
+    std::vector<std::string_view> args;
+    for (std::size_t i = 1; i < arr->size(); ++i) {
+        const auto* s = std::get_if<std::string>(&(*arr)[i].v);
+        if (!s) return err("argument must be bulk string");
+        args.emplace_back(*s);
+    }
+
+    if (name == "PING") {
+        if (args.empty()) return "+PONG\r\n";
+        return bulk_string(args[0]);
+    }
+    if (name == "ECHO") {
+        if (args.size() != 1) return err("wrong number of arguments");
+        return bulk_string(args[0]);
+    }
+    if (name == "COMMAND") return ok();
+    if (name == "QUIT")    return ok();
+
+    return store.dispatch(name, args);
+}
+
+}
+```
+
+## TCP server
+
+### src/server.hpp
+
+```cpp
+#pragma once
+#include "store.hpp"
+
+namespace redis {
+
+void run_server(int port);
+
+}
+```
+
+### src/server.cpp
+
+```cpp
+#include "server.hpp"
+#include "client.hpp"
+#include "store.hpp"
+
+#include <arpa/inet.h>
+#include <cstdio>
+#include <cstring>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <vector>
+
+namespace redis {
+
+void run_server(int port) {
+    int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(static_cast<std::uint16_t>(port));
+    ::bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    ::listen(lfd, 128);
+
+    std::fprintf(stdout, "myredis listening on port %d\n", port);
+
+    Store store;
+    std::vector<Client> clients;
+
+    while (true) {
+        fd_set rfds, wfds;
+        FD_ZERO(&rfds); FD_ZERO(&wfds);
+        FD_SET(lfd, &rfds);
+        int maxfd = lfd;
+
+        for (const auto& c : clients) {
+            FD_SET(c.fd, &rfds);
+            if (!c.wbuf.empty()) FD_SET(c.fd, &wfds);
+            if (c.fd > maxfd) maxfd = c.fd;
+        }
+
+        ::select(maxfd + 1, &rfds, &wfds, nullptr, nullptr);
+
+        if (FD_ISSET(lfd, &rfds)) {
+            int cfd = ::accept(lfd, nullptr, nullptr);
+            if (cfd >= 0) clients.push_back({cfd, {}, {}});
+        }
+
+        for (auto it = clients.begin(); it != clients.end(); ) {
+            auto& c = *it;
+            if (FD_ISSET(c.fd, &rfds)) {
+                char buf[4096];
+                ssize_t n = ::read(c.fd, buf, sizeof(buf));
+                if (n <= 0) {
+                    ::close(c.fd);
+                    it = clients.erase(it);
+                    continue;
+                }
+                c.rbuf.append(buf, n);
+                c.process(store);
+            }
+            if (FD_ISSET(c.fd, &wfds) && !c.wbuf.empty()) {
+                ssize_t sent = ::write(c.fd, c.wbuf.data(), c.wbuf.size());
+                if (sent > 0) c.wbuf.erase(0, sent);
+            }
+            ++it;
+        }
+    }
+}
+
+}
+```
+
+## main.cpp
+
+```cpp
+#include "server.hpp"
+#include <cstdlib>
+#include <cstdio>
+
+int main(int argc, char** argv) {
+    int port = 6379;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string_view{argv[i]} == "--port" && i + 1 < argc)
+            port = std::atoi(argv[++i]);
+    }
+    redis::run_server(port);
+}
+```
+
+## Try it
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/myredis --port 6380 &
+
+redis-cli -p 6380 PING
+# PONG
+
+redis-cli -p 6380 ECHO "hello world"
+# "hello world"
+```
+
+## Exercises
+
+1. Replace `select` with `epoll` (Linux) or `kqueue` (macOS) for better
+   performance at many concurrent connections.
+2. Add a configurable `--maxclients` limit and reject connections beyond it.
+3. Make the server non-blocking: set `O_NONBLOCK` on all fds and handle
+   `EAGAIN`.
+4. Parse `--port` from a `redis.conf`-style config file, not just CLI args.

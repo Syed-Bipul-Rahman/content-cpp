@@ -1,0 +1,502 @@
+---
+title: Core — Thompson NFA construction and simulation
+description: Build an NFA from the AST using Thompson construction, then simulate it to match strings.
+---
+
+# Core: Thompson NFA
+
+The parser gives us an AST. This lesson turns the AST into an NFA and
+simulates it. After this lesson `rengine` can match any pattern we support.
+
+## Thompson construction
+
+Each AST node becomes a small NFA **fragment** with exactly one entry state
+and one exit state. Fragments are wired together by ε transitions.
+
+The five key constructions:
+
+### Literal
+
+```
+    ──'a'──►
+```
+
+A single transition labelled `a`.
+
+### Concatenation
+
+```
+  [frag1]──ε──[frag2]
+```
+
+Wire frag1's exit into frag2's entry.
+
+### Alternation `a|b`
+
+```
+         ──ε──[fragA]──ε──
+  split─|                   |──►
+         ──ε──[fragB]──ε──
+```
+
+A new split state fans out into both fragments; both exits wire to a new
+join state.
+
+### Kleene star `a*`
+
+```
+        ┌──────ε──────┐
+        ▼             │
+  split──ε──[frag]──ε─┤
+        │
+        └──ε──► (bypass)
+```
+
+### One or more `a+`
+
+```
+  [frag]──split──ε──► (bypass)
+               │
+               └──ε──► frag.entry
+```
+
+## NFA data structures
+
+### src/nfa.hpp
+
+```cpp
+#pragma once
+#include "ast.hpp"
+
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace re {
+
+constexpr int EPS  = -1;   // ε transition
+constexpr int ANY  = -2;   // . (any char)
+constexpr int ANCHOR_BOL = -3;
+constexpr int ANCHOR_EOL = -4;
+
+struct State {
+    int  label{EPS};       // character (>=0), or EPS/ANY/ANCHOR_*
+    int  out1{-1};         // index of next state (-1 = none)
+    int  out2{-1};         // second out for split states
+    bool accept{false};
+    // For character classes:
+    std::string char_class;  // non-empty → match if char in class
+    bool        class_neg{false};
+};
+
+struct Frag {
+    int start;     // entry state index
+    int exit;      // exit state index (will be patched to accept)
+};
+
+class Nfa {
+public:
+    Frag compile(const AstNode* node);
+
+    std::size_t size()                  const { return states_.size(); }
+    const State& state(std::size_t i)   const { return states_[i]; }
+
+    // Called after compile() to mark the exit as accepting.
+    void mark_accept(int s) { states_[s].accept = true; }
+
+private:
+    std::vector<State> states_;
+
+    int new_state(int label = EPS, int out1 = -1, int out2 = -1) {
+        states_.push_back({label, out1, out2, false});
+        return static_cast<int>(states_.size()) - 1;
+    }
+
+    Frag compile_inner(const AstNode* n);
+    Frag compile_repeat(Frag f, int min, int max);
+};
+
+}
+```
+
+### src/nfa.cpp
+
+```cpp
+#include "nfa.hpp"
+#include <stdexcept>
+
+namespace re {
+
+Frag Nfa::compile(const AstNode* root) {
+    auto f = compile_inner(root);
+    mark_accept(f.exit);
+    return f;
+}
+
+Frag Nfa::compile_inner(const AstNode* n) {
+    return std::visit([&](const auto& v) -> Frag {
+        using T = std::decay_t<decltype(v)>;
+
+        if constexpr (std::is_same_v<T, AstLiteral>) {
+            int s0 = new_state(static_cast<unsigned char>(v.ch));
+            int s1 = new_state();
+            states_[s0].out1 = s1;
+            return {s0, s1};
+        }
+
+        else if constexpr (std::is_same_v<T, AstDot>) {
+            int s0 = new_state(ANY);
+            int s1 = new_state();
+            states_[s0].out1 = s1;
+            return {s0, s1};
+        }
+
+        else if constexpr (std::is_same_v<T, AstAnchorB>) {
+            int s0 = new_state(v.start ? ANCHOR_BOL : ANCHOR_EOL);
+            int s1 = new_state();
+            states_[s0].out1 = s1;
+            return {s0, s1};
+        }
+
+        else if constexpr (std::is_same_v<T, AstClass>) {
+            int s0 = new_state(EPS);   // label unused; checked via char_class
+            states_[s0].char_class = v.chars;
+            states_[s0].class_neg  = v.negated;
+            states_[s0].label      = -5;  // sentinel: class match
+            int s1 = new_state();
+            states_[s0].out1 = s1;
+            return {s0, s1};
+        }
+
+        else if constexpr (std::is_same_v<T, AstConcat>) {
+            if (v.children.empty()) {
+                int s = new_state(); return {s, s};
+            }
+            auto f = compile_inner(v.children[0].get());
+            for (std::size_t i = 1; i < v.children.size(); ++i) {
+                auto g = compile_inner(v.children[i].get());
+                // wire f.exit -> g.start via ε
+                states_[f.exit].out1 = g.start;
+                f.exit = g.exit;
+            }
+            return f;
+        }
+
+        else if constexpr (std::is_same_v<T, AstAlt>) {
+            auto lf = compile_inner(v.left.get());
+            auto rf = compile_inner(v.right.get());
+            int split = new_state(EPS, lf.start, rf.start);
+            int join  = new_state();
+            states_[lf.exit].out1 = join;
+            states_[rf.exit].out1 = join;
+            return {split, join};
+        }
+
+        else if constexpr (std::is_same_v<T, AstRepeat>) {
+            return compile_repeat(compile_inner(v.child.get()), v.min, v.max);
+        }
+
+        else if constexpr (std::is_same_v<T, AstGroup>) {
+            return compile_inner(v.child.get());
+        }
+
+        throw std::runtime_error("unknown ast node");
+    }, n->v);
+}
+
+Frag Nfa::compile_repeat(Frag f, int mn, int mx) {
+    // Handle {n,m} by unrolling:
+    //   repeat exactly mn times (mandatory copies)
+    //   then up to (mx - mn) optional copies (or infinite if mx == -1)
+
+    if (mn == 0 && mx == -1) {
+        // a*  — split with loop-back
+        int split = new_state(EPS, f.start, -1);  // out2 = bypass (patched below)
+        int bypass = new_state();
+        states_[split].out2 = bypass;
+        states_[f.exit].out1 = split;
+        return {split, bypass};
+    }
+    if (mn == 1 && mx == -1) {
+        // a+  — go through at least once, then loop
+        int split = new_state(EPS, f.start, -1);
+        int bypass = new_state();
+        states_[split].out2 = bypass;
+        states_[f.exit].out1 = split;
+        return {f.start, bypass};
+    }
+    if (mn == 0 && mx == 1) {
+        // a?  — split: take or bypass
+        int bypass = new_state();
+        int split  = new_state(EPS, f.start, bypass);
+        states_[f.exit].out1 = bypass;
+        return {split, bypass};
+    }
+
+    // General: unroll mn mandatory + (mx-mn) optional copies.
+    // For simplicity, re-compile the child for each copy. In production
+    // you'd clone states instead.
+    // Here we just return the fragment as-is for anything complicated —
+    // the exercises ask you to fill in the full version.
+    return f;
+}
+
+}
+```
+
+## NFA simulation
+
+The simulation maintains a **set of active states**. At each character:
+
+1. Compute the ε-closure of the current state set.
+2. For each active state that transitions on the current character, add the
+   target to the next set.
+3. The string matches if any state in the final set is accepting.
+
+### src/match.hpp
+
+```cpp
+#pragma once
+#include "nfa.hpp"
+
+#include <string>
+#include <string_view>
+#include <vector>
+#include <optional>
+
+namespace re {
+
+struct Match {
+    std::size_t start;
+    std::size_t end;
+};
+
+class Matcher {
+public:
+    // Compile the pattern once.
+    explicit Matcher(std::string_view pattern);
+
+    // Returns the first match in `text`, or nullopt.
+    std::optional<Match> find(std::string_view text) const;
+
+    // Returns true if the whole string matches (implicit ^ and $).
+    bool full_match(std::string_view text) const;
+
+    // Returns all non-overlapping matches.
+    std::vector<Match> find_all(std::string_view text) const;
+
+private:
+    Nfa   nfa_;
+    Frag  root_;
+
+    bool simulate(std::string_view text,
+                  std::size_t start,
+                  std::size_t& end_out) const;
+
+    void eps_closure(std::vector<int>& states,
+                     std::string_view text,
+                     std::size_t pos,
+                     bool at_bol) const;
+};
+
+}
+```
+
+### src/match.cpp
+
+```cpp
+#include "match.hpp"
+#include "parser.hpp"
+
+#include <algorithm>
+#include <set>
+
+namespace re {
+
+Matcher::Matcher(std::string_view pattern) {
+    auto ast = parse(pattern);
+    root_ = nfa_.compile(ast.get());
+}
+
+void Matcher::eps_closure(std::vector<int>& states,
+                           std::string_view text,
+                           std::size_t pos,
+                           bool at_bol) const {
+    // Iterative DFS over ε transitions.
+    std::vector<int> stack = states;
+    std::set<int>    seen(states.begin(), states.end());
+
+    while (!stack.empty()) {
+        int s = stack.back(); stack.pop_back();
+        const auto& st = nfa_.state(static_cast<std::size_t>(s));
+
+        auto maybe_push = [&](int t) {
+            if (t >= 0 && seen.insert(t).second) {
+                states.push_back(t);
+                stack.push_back(t);
+            }
+        };
+
+        if (st.label == EPS) {
+            maybe_push(st.out1);
+            maybe_push(st.out2);
+        } else if (st.label == ANCHOR_BOL) {
+            if (at_bol) maybe_push(st.out1);
+        } else if (st.label == ANCHOR_EOL) {
+            if (pos == text.size()) maybe_push(st.out1);
+        }
+    }
+}
+
+static bool char_matches(const State& st, char c) {
+    if (st.label == ANY)  return c != '\n';
+    if (st.label == -5) { // character class
+        bool found = st.char_class.find(c) != std::string::npos;
+        return st.class_neg ? !found : found;
+    }
+    return st.label == static_cast<unsigned char>(c);
+}
+
+bool Matcher::simulate(std::string_view text,
+                       std::size_t start,
+                       std::size_t& end_out) const {
+    std::vector<int> cur = {root_.start};
+    eps_closure(cur, text, start, start == 0);
+
+    std::size_t last_accept = std::string_view::npos;
+    if (std::any_of(cur.begin(), cur.end(), [&](int s) {
+            return nfa_.state(static_cast<std::size_t>(s)).accept; }))
+        last_accept = start;
+
+    for (std::size_t i = start; i < text.size(); ++i) {
+        char c = text[i];
+        std::vector<int> next;
+        for (int s : cur) {
+            const auto& st = nfa_.state(static_cast<std::size_t>(s));
+            if (char_matches(st, c) && st.out1 >= 0)
+                next.push_back(st.out1);
+        }
+        eps_closure(next, text, i + 1, false);
+
+        if (std::any_of(next.begin(), next.end(), [&](int s) {
+                return nfa_.state(static_cast<std::size_t>(s)).accept; }))
+            last_accept = i + 1;
+
+        if (next.empty()) break;
+        cur = std::move(next);
+    }
+
+    if (last_accept != std::string_view::npos) {
+        end_out = last_accept;
+        return true;
+    }
+    return false;
+}
+
+std::optional<Match> Matcher::find(std::string_view text) const {
+    for (std::size_t i = 0; i <= text.size(); ++i) {
+        std::size_t end;
+        if (simulate(text, i, end))
+            return Match{i, end};
+    }
+    return std::nullopt;
+}
+
+bool Matcher::full_match(std::string_view text) const {
+    std::size_t end;
+    return simulate(text, 0, end) && end == text.size();
+}
+
+std::vector<Match> Matcher::find_all(std::string_view text) const {
+    std::vector<Match> out;
+    std::size_t i = 0;
+    while (i <= text.size()) {
+        std::size_t end;
+        if (simulate(text, i, end)) {
+            out.push_back({i, end});
+            i = end > i ? end : end + 1;  // advance past zero-length match
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+}
+```
+
+## Wire up main.cpp
+
+```cpp
+#include "match.hpp"
+#include <iostream>
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "usage: rengine <pattern> <text>\n";
+        return 2;
+    }
+    try {
+        re::Matcher m{argv[1]};
+        auto result = m.find(argv[2]);
+        if (result) {
+            std::string_view text = argv[2];
+            std::cout << "match at [" << result->start << "," << result->end << "]: "
+                      << text.substr(result->start, result->end - result->start) << '\n';
+            return 0;
+        } else {
+            std::cout << "no match\n";
+            return 1;
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "error: " << e.what() << '\n';
+        return 2;
+    }
+}
+```
+
+## Try it
+
+```bash
+cmake --build build
+
+./build/rengine 'a(b|c)*d' 'xabcbcd'
+# match at [1,8]: abcbcd
+
+./build/rengine '\d+' 'price: 42 USD'
+# match at [7,9]: 42
+
+./build/rengine '^foo' 'foobar'
+# match at [0,3]: foo
+
+./build/rengine '^foo' 'xfoo'
+# no match
+
+./build/rengine '[a-z]+' 'Hello World'
+# match at [1,5]: ello
+```
+
+## Correctness check against `std::regex`
+
+```bash
+for pat in 'a*' 'a+b' 'a|b' '[0-9]+' '(ab)+'; do
+  for txt in '' a ab aab abc aaab 123; do
+    mine=$(./build/rengine "$pat" "$txt" && echo "match" || echo "no match")
+    ref=$(echo "$txt" | grep -oE "$pat" && echo "match" || echo "no match")
+    if [[ "$mine" != "$ref" ]]; then
+      echo "MISMATCH: pat=$pat txt=$txt mine=$mine ref=$ref"
+    fi
+  done
+done
+```
+
+## Exercises
+
+1. Implement the full `{n,m}` repeat in `compile_repeat` by properly
+   unrolling and cloning NFA fragments.
+2. Add capturing: record the start/end position for each group as the NFA
+   runs. This requires threading capture data through the state set.
+3. Add `--color` output to `main.cpp` that highlights matched substrings.
+4. Benchmark against `std::regex` on a million-character string. The NFA
+   simulator should be comparable or faster; a very long pattern that
+   backtracking `std::regex` would exponentially blow up should be instant.
