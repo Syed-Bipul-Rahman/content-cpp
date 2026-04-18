@@ -1,0 +1,163 @@
+---
+title: Prerequisites & mental model
+description: Content-addressable storage, the object model, and why Git's data layer is small.
+---
+
+# Prerequisites & mental model
+
+Git looks like a versioned filesystem with a complicated CLI. Underneath it
+is a tiny key-value store: you give it bytes, it gives you a SHA-1 (well,
+SHA-256 in newer Git — we'll use SHA-1 for compatibility). You give it the
+SHA-1 back later, you get the bytes. Everything else — branches, history,
+merges — is built on top of that one primitive.
+
+Linus's original design notes are worth reading once. The summary: **a
+content-addressable filesystem with a VCS pasted on top**.
+
+## What you should already know
+
+- C++ Fundamentals through lesson 21, especially file I/O and hashing.
+- Comfort with `git` as a user. You'll be shocked how thin it actually is.
+- Know what a tree, a hash, and a directory listing are.
+
+## The four object types
+
+Every byte stored in `.git/objects/` is one of these:
+
+| Type | Contains |
+| --- | --- |
+| **blob** | the bytes of a file |
+| **tree** | a list of (mode, name, sha) — like a directory listing |
+| **commit** | tree sha + parent shas + author + message |
+| **tag** | a name pointing at another object |
+
+That is the entire data model. Branches are files in `.git/refs/heads/` that
+contain a commit SHA. The index is one file at `.git/index`. There is no
+database. There is no daemon. There is a directory of compressed objects and
+a few small text files.
+
+## How an object is stored
+
+```
+header  = "<type> <length>\0"
+payload = the raw bytes for that type
+content = header + payload
+sha     = SHA-1(content)
+on_disk = zlib_compress(content)
+path    = .git/objects/<sha[0..2]>/<sha[2..]>
+```
+
+Two things to internalize:
+
+1. The SHA is computed over `<type> <length>\0<payload>`, not over
+   `<payload>` alone. That's why a blob and a tree with the same bytes have
+   different hashes.
+2. The on-disk file is zlib-compressed; the SHA is over the *uncompressed*
+   content.
+
+That's the whole storage protocol.
+
+## What a commit looks like
+
+Run this in any git repo:
+
+```bash
+git cat-file -p HEAD
+```
+
+You'll see something like:
+
+```
+tree 3a7c91...
+parent 21b0aa...
+author Linus Torvalds <torvalds@linux-foundation.org> 1700000000 -0800
+committer Linus Torvalds <torvalds@linux-foundation.org> 1700000000 -0800
+
+Initial commit
+```
+
+A commit is plain text. The `tree` line points at a tree object. That tree
+points at blobs and other trees. To check out a commit, you walk the tree
+and write each blob to disk. To diff two commits, you walk both trees in
+parallel.
+
+## What a tree looks like
+
+```bash
+git cat-file -p HEAD^{tree}
+```
+
+```
+100644 blob 8d0e41...   README.md
+040000 tree b9c0a1...   src
+```
+
+A tree is a sorted list of `(mode, type, sha, name)` rows, but the on-disk
+format is binary — `<mode> <name>\0<20-byte-sha>` per entry.
+
+## What we'll build
+
+| Lesson | Builds |
+| --- | --- |
+| 02 | scaffold, `init`, hash + write a blob |
+| 03 | `hash-object`, `cat-file`, `write-tree`, `commit-tree`, `log` |
+| 04 | index, `add`, `commit`, `status`, `diff`, branches, `checkout`, merge |
+| 05 | smart-HTTP push/pull, tests, packaging |
+
+About 1500–2000 lines of C++. The result is a `git` clone that can
+initialize a repo, commit work, branch, merge, and push to a real remote.
+
+## Dependencies
+
+We need exactly two third-party libraries:
+
+- **zlib** — for compressing/decompressing object files. Ubiquitous.
+- **OpenSSL** (or `mbedtls`) — for SHA-1.
+
+Install:
+
+```bash
+# macOS
+brew install zlib openssl
+
+# Debian/Ubuntu
+sudo apt-get install zlib1g-dev libssl-dev
+```
+
+We will deliberately not pull in libgit2 — the whole point is to write the
+data layer ourselves.
+
+## Why SHA-1 if it's broken?
+
+Git's collision resistance is no longer cryptographic, but git is migrating
+to SHA-256 lazily because:
+
+1. Most repos are not adversarial.
+2. Re-hashing the entire planet is expensive.
+3. Git verifies object integrity on read; a colliding object would be
+   noticed.
+
+For this project we use SHA-1 because it's what real Git uses and it makes
+debugging trivial — you can `cat-file` against your repo with real `git`.
+
+## The challenge: trace a commit by hand
+
+Pick any small repo, then:
+
+```bash
+HEAD_SHA=$(git rev-parse HEAD)
+git cat-file -p "$HEAD_SHA"            # commit
+TREE=$(git cat-file -p "$HEAD_SHA" | head -1 | cut -d' ' -f2)
+git cat-file -p "$TREE"                # tree
+BLOB=$(git cat-file -p "$TREE" | head -1 | awk '{print $3}')
+git cat-file -p "$BLOB"                # blob bytes
+```
+
+You just walked: commit → tree → blob. That is the whole read path of git.
+We're going to re-implement that walk, then build the write path on top of
+it.
+
+## Next
+
+Project scaffold: directory layout, CMake, the object store helpers, and
+`mygit init` + `mygit hash-object`.

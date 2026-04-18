@@ -1,0 +1,589 @@
+---
+title: Project scaffold — init, hash-object, cat-file
+description: Directory layout, CMake, the object store, and a working hash-object/cat-file pair.
+---
+
+# Project scaffold
+
+By the end of this lesson, `mygit` initializes a repository, hashes a file
+into the object store, and reads it back — exactly compatible with real
+`git cat-file`.
+
+## Directory layout
+
+```
+mygit/
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── cmd.hpp           # subcommand dispatch
+│   ├── repo.hpp/.cpp     # find .git, paths
+│   ├── object.hpp/.cpp   # read/write objects
+│   ├── sha1.hpp/.cpp     # SHA-1 wrapper
+│   ├── zlib_io.hpp/.cpp  # compress/decompress helpers
+│   └── hex.hpp/.cpp      # bytes <-> hex
+└── tests/
+    └── run.sh
+```
+
+```bash
+mkdir -p mygit/{src,tests} && cd mygit
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(mygit CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+find_package(ZLIB   REQUIRED)
+find_package(OpenSSL REQUIRED)
+
+add_executable(mygit
+    src/main.cpp
+    src/cmd.cpp
+    src/repo.cpp
+    src/object.cpp
+    src/sha1.cpp
+    src/zlib_io.cpp
+    src/hex.cpp
+)
+target_include_directories(mygit PRIVATE src)
+target_link_libraries(mygit PRIVATE ZLIB::ZLIB OpenSSL::Crypto)
+```
+
+## SHA-1 wrapper
+
+### src/sha1.hpp
+
+```cpp
+#pragma once
+#include <array>
+#include <cstdint>
+#include <string_view>
+
+namespace mygit {
+
+using Sha1 = std::array<std::uint8_t, 20>;
+
+Sha1 sha1(std::string_view bytes);
+
+}
+```
+
+### src/sha1.cpp
+
+```cpp
+#include "sha1.hpp"
+#include <openssl/sha.h>
+
+namespace mygit {
+
+Sha1 sha1(std::string_view bytes) {
+    Sha1 out{};
+    SHA1(reinterpret_cast<const unsigned char*>(bytes.data()),
+         bytes.size(), out.data());
+    return out;
+}
+
+}
+```
+
+If you'd rather not depend on OpenSSL, write SHA-1 yourself — the algorithm
+is ~150 lines and an excellent exercise. RFC 3174 has a reference.
+
+## Hex helpers
+
+### src/hex.hpp
+
+```cpp
+#pragma once
+#include "sha1.hpp"
+#include <string>
+#include <string_view>
+
+namespace mygit {
+
+std::string to_hex(const Sha1& s);
+Sha1        from_hex(std::string_view hex);  // throws on bad input
+
+}
+```
+
+### src/hex.cpp
+
+```cpp
+#include "hex.hpp"
+#include <stdexcept>
+
+namespace mygit {
+
+static const char kDigits[] = "0123456789abcdef";
+
+std::string to_hex(const Sha1& s) {
+    std::string out(40, '0');
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        out[2*i]     = kDigits[s[i] >> 4];
+        out[2*i + 1] = kDigits[s[i] & 0xF];
+    }
+    return out;
+}
+
+static int nyb(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    throw std::invalid_argument("bad hex");
+}
+
+Sha1 from_hex(std::string_view hex) {
+    if (hex.size() != 40) throw std::invalid_argument("sha length");
+    Sha1 out{};
+    for (std::size_t i = 0; i < 20; ++i) {
+        out[i] = static_cast<std::uint8_t>((nyb(hex[2*i]) << 4) | nyb(hex[2*i + 1]));
+    }
+    return out;
+}
+
+}
+```
+
+## zlib helpers
+
+### src/zlib_io.hpp
+
+```cpp
+#pragma once
+#include <string>
+#include <string_view>
+
+namespace mygit {
+
+std::string zlib_compress(std::string_view in);
+std::string zlib_decompress(std::string_view in);
+
+}
+```
+
+### src/zlib_io.cpp
+
+```cpp
+#include "zlib_io.hpp"
+
+#include <stdexcept>
+#include <zlib.h>
+
+namespace mygit {
+
+std::string zlib_compress(std::string_view in) {
+    uLongf bound = compressBound(in.size());
+    std::string out(bound, '\0');
+    if (::compress(reinterpret_cast<Bytef*>(out.data()), &bound,
+                   reinterpret_cast<const Bytef*>(in.data()),
+                   in.size()) != Z_OK) {
+        throw std::runtime_error("zlib compress failed");
+    }
+    out.resize(bound);
+    return out;
+}
+
+std::string zlib_decompress(std::string_view in) {
+    // We don't know the uncompressed size up front. Grow with a chunk loop.
+    z_stream s{};
+    if (inflateInit(&s) != Z_OK) throw std::runtime_error("inflateInit");
+    s.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+    s.avail_in = in.size();
+
+    std::string out;
+    char buf[16 * 1024];
+    int rc;
+    do {
+        s.next_out  = reinterpret_cast<Bytef*>(buf);
+        s.avail_out = sizeof(buf);
+        rc = inflate(&s, Z_NO_FLUSH);
+        if (rc != Z_OK && rc != Z_STREAM_END) {
+            inflateEnd(&s);
+            throw std::runtime_error("inflate failed");
+        }
+        out.append(buf, sizeof(buf) - s.avail_out);
+    } while (rc != Z_STREAM_END);
+    inflateEnd(&s);
+    return out;
+}
+
+}
+```
+
+## The repo: where is `.git`?
+
+### src/repo.hpp
+
+```cpp
+#pragma once
+#include <filesystem>
+#include <string>
+
+namespace mygit {
+
+class Repo {
+public:
+    static Repo discover();        // walks up from CWD; throws if none
+    static Repo init(const std::filesystem::path& root);
+
+    const std::filesystem::path& git_dir() const { return git_dir_; }
+    std::filesystem::path        object_path(const std::string& sha_hex) const;
+
+private:
+    explicit Repo(std::filesystem::path g) : git_dir_{std::move(g)} {}
+    std::filesystem::path git_dir_;
+};
+
+}
+```
+
+### src/repo.cpp
+
+```cpp
+#include "repo.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+namespace mygit {
+
+Repo Repo::discover() {
+    fs::path p = fs::current_path();
+    while (true) {
+        if (fs::is_directory(p / ".git")) return Repo{p / ".git"};
+        if (p == p.parent_path()) break;
+        p = p.parent_path();
+    }
+    throw std::runtime_error("not a mygit repository (no .git found)");
+}
+
+Repo Repo::init(const fs::path& root) {
+    fs::path g = root / ".git";
+    fs::create_directories(g / "objects");
+    fs::create_directories(g / "refs" / "heads");
+    fs::create_directories(g / "refs" / "tags");
+    {
+        std::ofstream{g / "HEAD"} << "ref: refs/heads/main\n";
+    }
+    {
+        std::ofstream cfg{g / "config"};
+        cfg << "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n";
+    }
+    return Repo{g};
+}
+
+fs::path Repo::object_path(const std::string& sha) const {
+    return git_dir_ / "objects" / sha.substr(0, 2) / sha.substr(2);
+}
+
+}
+```
+
+## The object store
+
+### src/object.hpp
+
+```cpp
+#pragma once
+#include "repo.hpp"
+#include <string>
+#include <string_view>
+
+namespace mygit {
+
+enum class ObjType { Blob, Tree, Commit, Tag };
+
+const char* type_name(ObjType t);
+ObjType     type_from_name(std::string_view s);
+
+struct Object {
+    ObjType     type;
+    std::string payload;     // raw bytes (may contain NULs)
+};
+
+// Compute the SHA the object would have without writing.
+std::string hash_object(ObjType t, std::string_view payload);
+
+// Write to .git/objects, return hex sha. Idempotent.
+std::string write_object(const Repo& r, ObjType t, std::string_view payload);
+
+// Read by hex sha.
+Object      read_object(const Repo& r, const std::string& sha);
+
+}
+```
+
+### src/object.cpp
+
+```cpp
+#include "object.hpp"
+#include "hex.hpp"
+#include "sha1.hpp"
+#include "zlib_io.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+
+namespace mygit {
+
+const char* type_name(ObjType t) {
+    switch (t) {
+        case ObjType::Blob:   return "blob";
+        case ObjType::Tree:   return "tree";
+        case ObjType::Commit: return "commit";
+        case ObjType::Tag:    return "tag";
+    }
+    return "?";
+}
+
+ObjType type_from_name(std::string_view s) {
+    if (s == "blob")   return ObjType::Blob;
+    if (s == "tree")   return ObjType::Tree;
+    if (s == "commit") return ObjType::Commit;
+    if (s == "tag")    return ObjType::Tag;
+    throw std::runtime_error("unknown object type");
+}
+
+static std::string framed(ObjType t, std::string_view payload) {
+    std::ostringstream os;
+    os << type_name(t) << ' ' << payload.size() << '\0';
+    os.write(payload.data(), payload.size());
+    return os.str();
+}
+
+std::string hash_object(ObjType t, std::string_view payload) {
+    return to_hex(sha1(framed(t, payload)));
+}
+
+std::string write_object(const Repo& r, ObjType t, std::string_view payload) {
+    std::string content = framed(t, payload);
+    std::string sha     = to_hex(sha1(content));
+    auto path = r.object_path(sha);
+    if (std::filesystem::exists(path)) return sha;
+    std::filesystem::create_directories(path.parent_path());
+    auto z = zlib_compress(content);
+    std::ofstream f{path, std::ios::binary};
+    f.write(z.data(), static_cast<std::streamsize>(z.size()));
+    return sha;
+}
+
+Object read_object(const Repo& r, const std::string& sha) {
+    auto path = r.object_path(sha);
+    std::ifstream f{path, std::ios::binary};
+    if (!f) throw std::runtime_error("object not found: " + sha);
+    std::ostringstream buf; buf << f.rdbuf();
+    auto raw = zlib_decompress(buf.str());
+
+    auto sp = raw.find(' ');
+    auto nul = raw.find('\0', sp);
+    if (sp == std::string::npos || nul == std::string::npos)
+        throw std::runtime_error("malformed object header");
+
+    Object o;
+    o.type    = type_from_name(std::string_view{raw.data(), sp});
+    o.payload = raw.substr(nul + 1);
+    return o;
+}
+
+}
+```
+
+## Subcommand dispatch
+
+### src/cmd.hpp
+
+```cpp
+#pragma once
+#include <span>
+#include <string_view>
+
+namespace mygit {
+
+int dispatch(std::string_view name, std::span<const std::string_view> args);
+
+int cmd_init        (std::span<const std::string_view> args);
+int cmd_hash_object (std::span<const std::string_view> args);
+int cmd_cat_file    (std::span<const std::string_view> args);
+
+}
+```
+
+### src/cmd.cpp
+
+```cpp
+#include "cmd.hpp"
+#include "object.hpp"
+#include "repo.hpp"
+
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+
+namespace mygit {
+
+int cmd_init(std::span<const std::string_view> args) {
+    auto root = args.empty() ? std::filesystem::current_path()
+                              : std::filesystem::path{std::string{args[0]}};
+    Repo::init(root);
+    std::cout << "Initialized empty mygit repository in "
+              << (root / ".git").string() << '\n';
+    return 0;
+}
+
+int cmd_hash_object(std::span<const std::string_view> args) {
+    bool write = false;
+    std::string path;
+    for (auto a : args) {
+        if (a == "-w") write = true;
+        else           path  = std::string{a};
+    }
+    if (path.empty()) { std::fprintf(stderr, "hash-object: file required\n"); return 2; }
+
+    std::ifstream f{path, std::ios::binary};
+    if (!f) { std::perror(path.c_str()); return 2; }
+    std::ostringstream buf; buf << f.rdbuf();
+
+    std::string sha;
+    if (write) {
+        auto r = Repo::discover();
+        sha = write_object(r, ObjType::Blob, buf.str());
+    } else {
+        sha = hash_object(ObjType::Blob, buf.str());
+    }
+    std::cout << sha << '\n';
+    return 0;
+}
+
+int cmd_cat_file(std::span<const std::string_view> args) {
+    if (args.size() < 2) {
+        std::fprintf(stderr, "cat-file: usage: -p|-t|-s <sha>\n");
+        return 2;
+    }
+    auto flag = args[0];
+    auto sha  = std::string{args[1]};
+    auto r    = Repo::discover();
+    auto obj  = read_object(r, sha);
+    if (flag == "-p") {
+        std::cout.write(obj.payload.data(),
+                        static_cast<std::streamsize>(obj.payload.size()));
+    } else if (flag == "-t") {
+        std::cout << type_name(obj.type) << '\n';
+    } else if (flag == "-s") {
+        std::cout << obj.payload.size() << '\n';
+    } else {
+        std::fprintf(stderr, "cat-file: unknown flag\n");
+        return 2;
+    }
+    return 0;
+}
+
+int dispatch(std::string_view name, std::span<const std::string_view> args) {
+    if (name == "init")        return cmd_init(args);
+    if (name == "hash-object") return cmd_hash_object(args);
+    if (name == "cat-file")    return cmd_cat_file(args);
+    std::fprintf(stderr, "mygit: unknown command: %.*s\n",
+                 static_cast<int>(name.size()), name.data());
+    return 2;
+}
+
+}
+```
+
+## src/main.cpp
+
+```cpp
+#include "cmd.hpp"
+
+#include <cstdio>
+#include <string_view>
+#include <vector>
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::fprintf(stderr, "usage: mygit <command> [args]\n");
+        return 2;
+    }
+    std::vector<std::string_view> args;
+    for (int i = 2; i < argc; ++i) args.emplace_back(argv[i]);
+    try {
+        return mygit::dispatch(argv[1], args);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "mygit: %s\n", e.what());
+        return 2;
+    }
+}
+```
+
+## Try it
+
+```bash
+cmake -S . -B build
+cmake --build build
+
+mkdir /tmp/playground && cd /tmp/playground
+/path/to/mygit/build/mygit init
+echo "hello world" > greet.txt
+
+# our hash
+/path/to/mygit/build/mygit hash-object greet.txt
+# 3b18e512dba79e4c8300dd08aeb37f8e728b8dad
+
+# real git's hash
+git hash-object greet.txt
+# 3b18e512dba79e4c8300dd08aeb37f8e728b8dad
+
+# write it
+/path/to/mygit/build/mygit hash-object -w greet.txt
+ls .git/objects/3b/
+# 18e512dba79e4c8300dd08aeb37f8e728b8dad
+
+# read it back
+/path/to/mygit/build/mygit cat-file -p 3b18e512dba79e4c8300dd08aeb37f8e728b8dad
+# hello world
+
+# real git can read your object too
+git cat-file -p 3b18e512dba79e4c8300dd08aeb37f8e728b8dad
+# hello world
+```
+
+That last command is the moment to celebrate. You wrote bytes that `git`
+itself accepts. Your data layer is correct.
+
+## Exit codes
+
+`mygit` returns 0 on success, 2 on error. Match git's basic conventions.
+
+## Exercises
+
+1. Implement `mygit ls-tree <sha>` using the object reader, even though we
+   haven't written trees yet. Use a real git repo for input.
+2. Add `--stdin` to `hash-object` so you can pipe content.
+3. Replace OpenSSL with a from-scratch SHA-1 implementation. Verify against
+   `openssl sha1` on a few inputs.
+4. Make object reads support an abbreviated SHA prefix (e.g. `3b18e5`),
+   resolving the unique full SHA from the directory listing.

@@ -1,0 +1,491 @@
+---
+title: Project scaffold — args, files, output loop
+description: Directory layout, CMake, arg parsing, and a grep that matches literal strings.
+---
+
+# Project scaffold
+
+Stand up the project, parse arguments, and wire up an input loop. By the
+end of this lesson, `mgrep` finds a literal string in a file.
+
+## Directory layout
+
+```
+mgrep/
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── args.hpp
+│   ├── args.cpp
+│   ├── grep.hpp
+│   ├── grep.cpp
+│   ├── matcher.hpp
+│   └── matcher.cpp
+└── tests/
+    └── run.sh
+```
+
+```bash
+mkdir -p mgrep/{src,tests} && cd mgrep
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(mgrep CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+add_executable(mgrep
+    src/main.cpp
+    src/args.cpp
+    src/grep.cpp
+    src/matcher.cpp
+)
+target_include_directories(mgrep PRIVATE src)
+```
+
+## Argument parsing
+
+### src/args.hpp
+
+```cpp
+#pragma once
+
+#include <string>
+#include <vector>
+
+namespace mgrep {
+
+struct Args {
+    std::string              pattern;
+    std::vector<std::string> files;
+
+    bool ignore_case   = false;  // -i
+    bool invert        = false;  // -v
+    bool show_line_no  = false;  // -n
+    bool count_only    = false;  // -c
+    bool names_only    = false;  // -l
+    bool recursive     = false;  // -r / -R
+    bool whole_word    = false;  // -w
+    bool whole_line    = false;  // -x
+    bool fixed_string  = false;  // -F
+    bool extended      = false;  // -E
+    bool color         = false;  // --color / tty autodetect
+};
+
+Args parse(int argc, char** argv);
+
+}
+```
+
+### src/args.cpp
+
+```cpp
+#include "args.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <unistd.h>
+
+namespace mgrep {
+
+namespace {
+
+[[noreturn]] void usage() {
+    std::fprintf(stderr,
+        "usage: mgrep [options] PATTERN [FILE...]\n"
+        "  -i          ignore case\n"
+        "  -v          invert match\n"
+        "  -n          prefix line numbers\n"
+        "  -c          count only\n"
+        "  -l          print names with matches\n"
+        "  -r, -R      recurse into directories\n"
+        "  -w          whole word\n"
+        "  -x          whole line\n"
+        "  -F          fixed string (no regex)\n"
+        "  -E          extended regex\n"
+        "  --color     force color output\n"
+        "  --no-color  never color\n"
+        "  -h, --help  this help\n");
+    std::exit(2);
+}
+
+bool want_color(const Args& a) {
+    const char* nc = std::getenv("NO_COLOR");
+    if (nc && *nc) return false;
+    return a.color || ::isatty(STDOUT_FILENO);
+}
+
+}  // anon
+
+Args parse(int argc, char** argv) {
+    Args a;
+    bool force_color = false;
+    bool no_color    = false;
+
+    int i = 1;
+    for (; i < argc; ++i) {
+        std::string_view s = argv[i];
+        if (s == "--") { ++i; break; }
+        if (s == "--help" || s == "-h") usage();
+        if (s == "--color")    { force_color = true; continue; }
+        if (s == "--no-color") { no_color    = true; continue; }
+
+        if (s.starts_with("-") && s.size() > 1 && s[1] != '-') {
+            for (char c : s.substr(1)) {
+                switch (c) {
+                    case 'i': a.ignore_case  = true; break;
+                    case 'v': a.invert       = true; break;
+                    case 'n': a.show_line_no = true; break;
+                    case 'c': a.count_only   = true; break;
+                    case 'l': a.names_only   = true; break;
+                    case 'r': case 'R': a.recursive = true; break;
+                    case 'w': a.whole_word   = true; break;
+                    case 'x': a.whole_line   = true; break;
+                    case 'F': a.fixed_string = true; break;
+                    case 'E': a.extended     = true; break;
+                    default:
+                        std::fprintf(stderr, "unknown flag: -%c\n", c);
+                        usage();
+                }
+            }
+            continue;
+        }
+
+        // positional
+        if (a.pattern.empty()) a.pattern = std::string{s};
+        else                   a.files.emplace_back(s);
+    }
+    for (; i < argc; ++i) {
+        if (a.pattern.empty()) a.pattern = argv[i];
+        else                   a.files.emplace_back(argv[i]);
+    }
+    if (a.pattern.empty()) usage();
+
+    if (no_color)         a.color = false;
+    else if (force_color) a.color = true;
+    else                  a.color = want_color(a);
+
+    return a;
+}
+
+}
+```
+
+## A first matcher — literal substring
+
+### src/matcher.hpp
+
+```cpp
+#pragma once
+#include "args.hpp"
+#include <string_view>
+#include <utility>
+
+namespace mgrep {
+
+// Returns (matched, start, end) — start/end are byte offsets in the line.
+// For a single match on the line. We'll extend to all matches in a later lesson.
+struct MatchResult {
+    bool        matched;
+    std::size_t start;
+    std::size_t end;
+};
+
+class Matcher {
+public:
+    explicit Matcher(const Args& args);
+    MatchResult find(std::string_view line) const;
+
+private:
+    std::string pattern_;
+    bool ignore_case_;
+    bool whole_word_;
+    bool whole_line_;
+};
+
+}
+```
+
+### src/matcher.cpp
+
+```cpp
+#include "matcher.hpp"
+
+#include <cctype>
+
+namespace mgrep {
+
+namespace {
+
+char lower(char c) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+}
+
+bool is_word_ch(char c) {
+    unsigned char u = static_cast<unsigned char>(c);
+    return std::isalnum(u) || u == '_';
+}
+
+std::size_t find_case(std::string_view hay, std::string_view needle, bool ci) {
+    if (needle.empty()) return 0;
+    if (!ci) return hay.find(needle);
+    for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        bool ok = true;
+        for (std::size_t j = 0; j < needle.size(); ++j) {
+            if (lower(hay[i + j]) != lower(needle[j])) { ok = false; break; }
+        }
+        if (ok) return i;
+    }
+    return std::string_view::npos;
+}
+
+}  // anon
+
+Matcher::Matcher(const Args& a)
+    : pattern_{a.pattern}, ignore_case_{a.ignore_case},
+      whole_word_{a.whole_word}, whole_line_{a.whole_line} {}
+
+MatchResult Matcher::find(std::string_view line) const {
+    if (whole_line_) {
+        bool ok;
+        if (ignore_case_) {
+            if (line.size() != pattern_.size()) ok = false;
+            else {
+                ok = true;
+                for (std::size_t i = 0; i < line.size(); ++i)
+                    if (lower(line[i]) != lower(pattern_[i])) { ok = false; break; }
+            }
+        } else {
+            ok = (line == pattern_);
+        }
+        return {ok, 0, ok ? line.size() : 0};
+    }
+
+    std::size_t pos = find_case(line, pattern_, ignore_case_);
+    while (pos != std::string_view::npos) {
+        bool ok = true;
+        if (whole_word_) {
+            std::size_t end = pos + pattern_.size();
+            if (pos > 0            && is_word_ch(line[pos - 1])) ok = false;
+            if (end < line.size()  && is_word_ch(line[end]))     ok = false;
+        }
+        if (ok) return {true, pos, pos + pattern_.size()};
+        pos = find_case(line.substr(pos + 1), pattern_, ignore_case_);
+        if (pos == std::string_view::npos) break;
+        pos += 1;  // adjust back to absolute offset — leave this as TODO for lesson 3
+        break;     // simplified: skip re-search for now; real impl tracks offsets
+    }
+    return {false, 0, 0};
+}
+
+}
+```
+
+(We're oversimplifying the `whole_word` retry loop — next lesson's regex
+path handles this cleanly. For now, the common case works and
+`find_case_from(offset)` is an exercise.)
+
+## The grep loop
+
+### src/grep.hpp
+
+```cpp
+#pragma once
+#include "args.hpp"
+#include "matcher.hpp"
+#include <iosfwd>
+#include <string>
+
+namespace mgrep {
+
+class Grep {
+public:
+    Grep(const Args& args, const Matcher& matcher) : args_{args}, matcher_{matcher} {}
+
+    int run_file(const std::string& path);   // "-" means stdin
+    int run();                                // iterate args.files
+
+    int exit_code() const { return any_match_ ? 0 : 1; }
+
+private:
+    int run_stream(std::istream& in, const std::string& name);
+    void print_match(const std::string& name, std::size_t lineno,
+                     const std::string& line, const MatchResult& r);
+
+    const Args& args_;
+    const Matcher& matcher_;
+    bool any_match_ = false;
+};
+
+}
+```
+
+### src/grep.cpp
+
+```cpp
+#include "grep.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+
+namespace mgrep {
+
+namespace {
+constexpr const char* kRed    = "\x1b[31;1m";
+constexpr const char* kPurple = "\x1b[35m";
+constexpr const char* kGreen  = "\x1b[32m";
+constexpr const char* kReset  = "\x1b[0m";
+}  // anon
+
+int Grep::run_stream(std::istream& in, const std::string& name) {
+    std::string line;
+    std::size_t n = 0;
+    std::size_t count = 0;
+    bool file_has_match = false;
+
+    while (std::getline(in, line)) {
+        ++n;
+        auto r = matcher_.find(line);
+        bool matched = r.matched;
+        if (args_.invert) matched = !matched;
+        if (!matched) continue;
+
+        any_match_ = true;
+        file_has_match = true;
+        ++count;
+
+        if (args_.names_only) { std::cout << name << '\n'; return 0; }
+        if (args_.count_only) continue;
+        print_match(name, n, line, r);
+    }
+
+    if (args_.count_only) {
+        if (!args_.files.empty() && args_.files.size() > 1) std::cout << name << ':';
+        std::cout << count << '\n';
+    }
+    (void)file_has_match;
+    return 0;
+}
+
+void Grep::print_match(const std::string& name, std::size_t lineno,
+                       const std::string& line, const MatchResult& r) {
+    const bool multifile = args_.files.size() > 1 || args_.recursive;
+
+    if (multifile) {
+        if (args_.color) std::cout << kPurple << name << kReset << ':';
+        else             std::cout << name << ':';
+    }
+    if (args_.show_line_no) {
+        if (args_.color) std::cout << kGreen << lineno << kReset << ':';
+        else             std::cout << lineno << ':';
+    }
+
+    if (!args_.color || !r.matched || args_.invert) {
+        std::cout << line << '\n';
+        return;
+    }
+    std::cout.write(line.data(), r.start);
+    std::cout << kRed;
+    std::cout.write(line.data() + r.start, r.end - r.start);
+    std::cout << kReset;
+    std::cout.write(line.data() + r.end, line.size() - r.end);
+    std::cout << '\n';
+}
+
+int Grep::run_file(const std::string& path) {
+    if (path == "-") return run_stream(std::cin, "(stdin)");
+
+    namespace fs = std::filesystem;
+    if (args_.recursive && fs::is_directory(path)) {
+        for (const auto& e : fs::recursive_directory_iterator(path)) {
+            if (e.is_regular_file()) run_file(e.path().string());
+        }
+        return 0;
+    }
+    std::ifstream f{path};
+    if (!f) { std::perror(path.c_str()); return 2; }
+    return run_stream(f, path);
+}
+
+int Grep::run() {
+    if (args_.files.empty()) return run_file("-");
+    for (const auto& p : args_.files) run_file(p);
+    return 0;
+}
+
+}
+```
+
+## src/main.cpp
+
+```cpp
+#include "args.hpp"
+#include "grep.hpp"
+#include "matcher.hpp"
+
+int main(int argc, char** argv) {
+    try {
+        auto args    = mgrep::parse(argc, argv);
+        mgrep::Matcher m{args};
+        mgrep::Grep    g{args, m};
+        g.run();
+        return g.exit_code();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "mgrep: %s\n", e.what());
+        return 2;
+    }
+}
+```
+
+## Build and try
+
+```bash
+cmake -S . -B build
+cmake --build build
+
+echo -e "apple\nbanana\ncherry\napricot" > /tmp/fruits
+./build/mgrep 'ap' /tmp/fruits
+# apple
+# apricot
+
+./build/mgrep -n 'ap' /tmp/fruits
+# 1:apple
+# 4:apricot
+
+./build/mgrep -c 'ap' /tmp/fruits
+# 2
+
+./build/mgrep -v 'ap' /tmp/fruits
+# banana
+# cherry
+```
+
+## Exit codes
+
+Real `grep` returns 0 if any match, 1 if none, 2 on error. We match that.
+
+## Exercises
+
+1. Finish the `whole_word` retry loop in `matcher.cpp`. Write a test that
+   `a` does NOT match `apple` with `-w`, but does match `a cat`.
+2. Add `-B N` / `-A N` / `-C N` (before/after/context lines).
+3. Implement `--include=GLOB` / `--exclude=GLOB` for `-r` to skip files.
+4. Read a pattern from `-f FILE` (one pattern per line, any match counts).

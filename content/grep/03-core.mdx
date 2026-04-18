@@ -1,0 +1,287 @@
+---
+title: Core — regex, multiple matches, all-on-line
+description: Swap the literal matcher for a real regex engine, and highlight every match.
+---
+
+# Core: regex matching
+
+Literal search is useful for about an hour. Real `grep` takes patterns.
+We'll use `std::regex` for correctness, keep the literal fast-path for
+`-F`, and highlight every match on every line.
+
+Later, if you want to build the regex engine yourself, the
+[Regex Engine track](/projects/regex-engine) shows how — and you can plug
+it in here.
+
+## Matcher interface
+
+Rewrite `matcher.hpp` to support "all matches on a line":
+
+```cpp
+#pragma once
+#include "args.hpp"
+#include <string>
+#include <string_view>
+#include <vector>
+#include <regex>
+
+namespace mgrep {
+
+struct Range { std::size_t start; std::size_t end; };
+
+class Matcher {
+public:
+    explicit Matcher(const Args& args);
+
+    // Populates `out` with match ranges in `line`. Returns true if any.
+    bool find_all(std::string_view line, std::vector<Range>& out) const;
+
+private:
+    bool fixed_;
+    bool ignore_case_;
+    bool whole_word_;
+    bool whole_line_;
+
+    std::string      needle_;      // for -F
+    std::regex       re_;          // for regex mode
+};
+
+}
+```
+
+## matcher.cpp — both strategies
+
+```cpp
+#include "matcher.hpp"
+
+#include <cctype>
+#include <stdexcept>
+
+namespace mgrep {
+
+namespace {
+
+char lower(char c) {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+}
+
+bool is_word(char c) {
+    auto u = static_cast<unsigned char>(c);
+    return std::isalnum(u) || u == '_';
+}
+
+// Case-sensitive/insensitive find starting at `from`.
+std::size_t find_from(std::string_view hay, std::string_view needle,
+                      std::size_t from, bool ci) {
+    if (needle.empty()) return from <= hay.size() ? from : std::string_view::npos;
+    for (std::size_t i = from; i + needle.size() <= hay.size(); ++i) {
+        bool ok = true;
+        for (std::size_t j = 0; j < needle.size(); ++j) {
+            char a = hay[i + j], b = needle[j];
+            if (ci) { a = lower(a); b = lower(b); }
+            if (a != b) { ok = false; break; }
+        }
+        if (ok) return i;
+    }
+    return std::string_view::npos;
+}
+
+// Build a regex from the pattern, honoring -F / -E / -i / -w / -x.
+std::regex build_regex(const Args& a) {
+    std::string pat = a.pattern;
+
+    auto escape = [](const std::string& s) {
+        static const std::string meta{".^$|()[]{}*+?\\"};
+        std::string out;
+        for (char c : s) {
+            if (meta.find(c) != std::string::npos) out.push_back('\\');
+            out.push_back(c);
+        }
+        return out;
+    };
+
+    if (a.fixed_string) pat = escape(pat);
+    if (a.whole_word)   pat = "\\b(?:" + pat + ")\\b";
+    if (a.whole_line)   pat = "^(?:" + pat + ")$";
+
+    auto syntax = a.extended ? std::regex::ECMAScript : std::regex::ECMAScript;
+    // std::regex doesn't have BRE/ERE selection cleanly; ECMAScript is closest to egrep
+    auto opts = syntax;
+    if (a.ignore_case) opts |= std::regex::icase;
+
+    try { return std::regex{pat, opts}; }
+    catch (const std::regex_error& e) {
+        throw std::runtime_error(std::string{"bad regex: "} + e.what());
+    }
+}
+
+}  // anon
+
+Matcher::Matcher(const Args& a)
+    : fixed_{a.fixed_string},
+      ignore_case_{a.ignore_case},
+      whole_word_{a.whole_word},
+      whole_line_{a.whole_line}
+{
+    if (fixed_ && !whole_word_ && !whole_line_) {
+        needle_ = a.pattern;
+    } else {
+        re_ = build_regex(a);
+    }
+}
+
+bool Matcher::find_all(std::string_view line, std::vector<Range>& out) const {
+    out.clear();
+
+    if (fixed_ && !whole_word_ && !whole_line_) {
+        std::size_t i = 0;
+        while (true) {
+            std::size_t p = find_from(line, needle_, i, ignore_case_);
+            if (p == std::string_view::npos) break;
+            out.push_back({p, p + needle_.size()});
+            i = p + std::max<std::size_t>(needle_.size(), 1);
+        }
+        return !out.empty();
+    }
+
+    // Regex path
+    using It = std::string_view::const_iterator;
+    auto begin = std::cregex_iterator(line.data(), line.data() + line.size(), re_);
+    auto end   = std::cregex_iterator();
+    for (auto it = begin; it != end; ++it) {
+        auto& m = *it;
+        std::size_t s = static_cast<std::size_t>(m.position(0));
+        std::size_t e = s + static_cast<std::size_t>(m.length(0));
+        if (e == s) { ++s; if (s > line.size()) break; }   // empty-match guard
+        out.push_back({s, e});
+    }
+    return !out.empty();
+}
+
+}
+```
+
+## grep.cpp — print every match
+
+Modify the printing path to use the match list:
+
+```cpp
+void Grep::print_match_line(const std::string& name, std::size_t lineno,
+                            const std::string& line,
+                            const std::vector<Range>& ranges) {
+    const bool multifile = args_.files.size() > 1 || args_.recursive;
+
+    if (multifile) {
+        if (args_.color) std::cout << "\x1b[35m" << name << "\x1b[0m:";
+        else             std::cout << name << ':';
+    }
+    if (args_.show_line_no) {
+        if (args_.color) std::cout << "\x1b[32m" << lineno << "\x1b[0m:";
+        else             std::cout << lineno << ':';
+    }
+
+    if (!args_.color || ranges.empty() || args_.invert) {
+        std::cout << line << '\n';
+        return;
+    }
+
+    std::size_t cursor = 0;
+    for (const auto& r : ranges) {
+        std::cout.write(line.data() + cursor, r.start - cursor);
+        std::cout << "\x1b[31;1m";
+        std::cout.write(line.data() + r.start, r.end - r.start);
+        std::cout << "\x1b[0m";
+        cursor = r.end;
+    }
+    std::cout.write(line.data() + cursor, line.size() - cursor);
+    std::cout << '\n';
+}
+```
+
+And change `run_stream`:
+
+```cpp
+int Grep::run_stream(std::istream& in, const std::string& name) {
+    std::string line;
+    std::size_t n = 0;
+    std::size_t count = 0;
+    std::vector<Range> ranges;
+
+    while (std::getline(in, line)) {
+        ++n;
+        bool matched = matcher_.find_all(line, ranges);
+        if (args_.invert) matched = !matched;
+        if (!matched) continue;
+
+        any_match_ = true;
+        ++count;
+
+        if (args_.names_only) { std::cout << name << '\n'; return 0; }
+        if (args_.count_only) continue;
+        print_match_line(name, n, line, args_.invert ? std::vector<Range>{} : ranges);
+    }
+
+    if (args_.count_only) {
+        if (args_.files.size() > 1) std::cout << name << ':';
+        std::cout << count << '\n';
+    }
+    return 0;
+}
+```
+
+Update the header accordingly.
+
+## Try it
+
+```bash
+cmake --build build
+
+echo -e "foo\nbar\nbaz\nfoobar\nFOO" > /tmp/t.txt
+
+./build/mgrep 'b[ao]' /tmp/t.txt
+# bar
+# baz
+# foobar
+
+./build/mgrep -i 'foo' /tmp/t.txt
+# foo
+# foobar
+# FOO
+
+./build/mgrep -F '[ao]' /tmp/t.txt
+# (no matches — fixed string)
+
+./build/mgrep -w 'bar' /tmp/t.txt
+# bar
+```
+
+Every match on a line is highlighted if `--color` is active.
+
+## Invert + count together
+
+`grep -cv 'foo' /tmp/t.txt` should print the count of non-matches.
+
+Make sure `count_only` and `invert` compose. Test against real `grep`.
+
+## Performance note
+
+`std::regex` is correct but not fast. A serious `grep` uses:
+
+- A literal fast-path (what we have for `-F`).
+- Boyer-Moore-Horspool for single literal patterns.
+- Aho-Corasick for many literals.
+- A compiled DFA for regex.
+
+Swap the engine for one from the [Regex Engine track](/projects/regex-engine)
+if you want production speeds. It's a clean boundary — just replace the
+`Matcher` implementation.
+
+## Exercises
+
+1. Add a literal Boyer-Moore-Horspool fast path for `-F` on long inputs.
+   Benchmark against the current loop.
+2. Make `-F` accept multiple patterns separated by newlines (`grep -Ff file`).
+3. Implement `--only-matching` / `-o`, which prints only the matched
+   substring, one per line.
+4. Benchmark `mgrep` vs GNU `grep` on a 500 MB log file with a simple
+   literal pattern. Where are we losing time?

@@ -1,0 +1,122 @@
+---
+title: Prerequisites & mental model
+description: What grep is, what it isn't, and the pattern-matching question we're solving.
+---
+
+# Prerequisites & mental model
+
+`grep` is one of the oldest, most-used Unix tools. Dennis Ritchie wrote the
+name as a contraction of a `ed` command: `g/re/p` — global, regex, print.
+That's all it is: **for every line in the input, if a pattern matches, print
+the line**.
+
+## What you should already know
+
+- C++ Fundamentals through lesson 21, especially strings, files, and I/O.
+- Basic regular expressions at the user level — what `.`, `*`, `?`, `[a-z]`
+  mean.
+- Comfort at a shell. Most exercises use `diff` against the real `grep`.
+
+## What grep does (precisely)
+
+```
+grep [options] PATTERN [FILE...]
+```
+
+For each input line:
+
+1. Test whether PATTERN matches.
+2. If yes: print the line (plus filename/line number depending on flags).
+3. If no: skip.
+
+That's the whole specification. The art is the flags, the speed, and the
+edge cases.
+
+## Flags we'll implement
+
+| Flag | Meaning |
+| --- | --- |
+| (default) | print matching lines |
+| `-i` | case-insensitive match |
+| `-v` | invert — print non-matches |
+| `-n` | prefix with line number |
+| `-c` | print only a count |
+| `-l` | print only filenames that contain a match |
+| `-r` | recursively walk directories |
+| `-w` | match whole words only |
+| `-x` | match the entire line only |
+| `-F` | fixed-string match (no regex) |
+| `-E` | extended regex (POSIX `egrep`) |
+| `--color` | highlight matches when stdout is a TTY |
+
+About fifteen flags total. Real `grep` has fifty — we'll stop where the
+educational value does.
+
+## What `grep` is *not*
+
+- It is not a syntax-aware tool. It doesn't know what a function is. Use
+  `ctags`/`ripgrep`/semantic tools for that.
+- It is not a text editor. It prints; it doesn't modify. `sed` is the
+  substitution sibling.
+- It is not streaming-regex-compiled-to-NFA. Real `grep` uses a mix of
+  literal scanning, Boyer-Moore, Aho-Corasick, and DFA. We'll cover literal
+  and regex, and note where the optimizations live.
+
+## The high-level flow
+
+```
+argv  ─► parse flags ─► compile pattern ─► for each input source ─►
+  for each line ─► test ─► maybe print
+```
+
+We will literally write it in that order.
+
+## Streaming, not slurping
+
+A fundamental decision: `grep` processes input **line by line**, never
+loading the whole file. On a 10 GB log file, that's the difference between
+"works" and "doesn't".
+
+```cpp
+std::ifstream f{path};
+std::string line;
+while (std::getline(f, line)) {
+    // test and maybe print
+}
+```
+
+Simple. Correct. Fast enough for the first version.
+
+## Performance, briefly
+
+`grep` is often faster than you'd expect because:
+
+1. It avoids allocations on the hot path.
+2. It uses `memchr` to skip whole blocks when the first character of the
+   pattern is rare.
+3. For fixed strings, Boyer-Moore or a 3-gram filter skips bytes instead of
+   stepping through them.
+4. For regex, a compiled DFA is much faster than a backtracking NFA.
+
+We'll get the correct version working first, then profile and add speed
+where it matters.
+
+## The challenge — install real grep
+
+```bash
+grep --version
+```
+
+Your reference implementation. Every test we write compares our output to
+`grep`'s. If you're on BSD (macOS), GNU grep from Homebrew (`ggrep`) has more
+features and tests we'll want — install it as a second reference:
+
+```bash
+brew install grep       # provides `ggrep`
+```
+
+## Next
+
+Project scaffold: directory layout, CMake, an `argv` parser, and the output
+loop wired to hard-coded matches. Same pattern as shell and webserver —
+get the skeleton breathing before we put muscles on it.

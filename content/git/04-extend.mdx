@@ -1,0 +1,656 @@
+---
+title: Extending — index, add, commit, status, diff, branches, checkout, merge
+description: The staging area, working-directory commands, branches, and 3-way merge.
+---
+
+# Extending mygit
+
+Lesson 03 gave you raw plumbing. This lesson adds the porcelain that
+people actually type: `add`, `commit`, `status`, `diff`, `branch`,
+`checkout`, and a 3-way merge.
+
+## The index
+
+The index (`.git/index`) is a binary file that tracks the *staged* state
+of the working tree. Each entry records:
+
+```
+ctime_sec, ctime_nsec   (32-bit each)
+mtime_sec, mtime_nsec   (32-bit each)
+dev, ino                (32-bit each)
+mode                    (32-bit)
+uid, gid                (32-bit each)
+file_size               (32-bit)
+sha                     (20-byte raw)
+flags                   (16-bit: length of name in low 12 bits)
+name                    (variable, NUL-terminated, padded to 8 bytes)
+```
+
+The header is `DIRC` + version (2) + entry count, all big-endian 32-bit.
+A SHA-1 of the whole file follows the last entry.
+
+We'll implement version 2, which covers everything needed for `add`
+and `status`.
+
+### src/index.hpp
+
+```cpp
+#pragma once
+#include "repo.hpp"
+#include "sha1.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace mygit {
+
+struct IndexEntry {
+    std::uint32_t ctime_s{}, ctime_n{};
+    std::uint32_t mtime_s{}, mtime_n{};
+    std::uint32_t dev{}, ino{};
+    std::uint32_t mode{0x81A4};  // 100644
+    std::uint32_t uid{}, gid{};
+    std::uint32_t size{};
+    std::string   sha_hex;
+    std::string   path;          // relative to work-tree root
+};
+
+class Index {
+public:
+    static Index read(const Repo& r);
+    void         write(const Repo& r) const;
+
+    void add(const IndexEntry& e);
+    void remove(const std::string& path);
+    std::optional<IndexEntry> find(const std::string& path) const;
+
+    const std::vector<IndexEntry>& entries() const { return entries_; }
+
+private:
+    std::vector<IndexEntry> entries_;
+};
+
+// Build an IndexEntry for a path on disk.
+IndexEntry stat_to_entry(const std::filesystem::path& abs,
+                         const std::string& rel,
+                         const std::string& sha_hex);
+
+}
+```
+
+### src/index.cpp
+
+The index is big-endian binary. We write a minimal read/write using
+`htonl`/`ntohl`:
+
+```cpp
+#include "index.hpp"
+#include "hex.hpp"
+#include "sha1.hpp"
+
+#include <algorithm>
+#include <arpa/inet.h>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <sys/stat.h>
+
+namespace fs = std::filesystem;
+
+namespace mygit {
+
+static std::uint32_t ru32(const char* p) {
+    std::uint32_t v; std::memcpy(&v, p, 4); return ntohl(v);
+}
+static void wu32(char* p, std::uint32_t v) {
+    v = htonl(v); std::memcpy(p, &v, 4);
+}
+
+Index Index::read(const Repo& r) {
+    Index idx;
+    auto path = r.git_dir() / "index";
+    if (!fs::exists(path)) return idx;
+
+    std::ifstream f{path, std::ios::binary};
+    std::ostringstream b; b << f.rdbuf();
+    std::string raw = b.str();
+    if (raw.size() < 12) return idx;
+
+    std::uint32_t count = ru32(raw.data() + 8);
+    std::size_t i = 12;
+    for (std::uint32_t n = 0; n < count; ++n) {
+        if (i + 62 > raw.size()) break;
+        IndexEntry e;
+        e.ctime_s = ru32(raw.data() + i);      i += 4;
+        e.ctime_n = ru32(raw.data() + i);      i += 4;
+        e.mtime_s = ru32(raw.data() + i);      i += 4;
+        e.mtime_n = ru32(raw.data() + i);      i += 4;
+        e.dev     = ru32(raw.data() + i);      i += 4;
+        e.ino     = ru32(raw.data() + i);      i += 4;
+        e.mode    = ru32(raw.data() + i);      i += 4;
+        e.uid     = ru32(raw.data() + i);      i += 4;
+        e.gid     = ru32(raw.data() + i);      i += 4;
+        e.size    = ru32(raw.data() + i);      i += 4;
+        Sha1 sha{}; std::memcpy(sha.data(), raw.data() + i, 20); i += 20;
+        e.sha_hex = to_hex(sha);
+        std::uint16_t flags; std::memcpy(&flags, raw.data() + i, 2); i += 2;
+        flags = ntohs(flags);
+        std::uint16_t namelen = flags & 0xFFF;
+        if (namelen == 0xFFF) {
+            auto end = raw.find('\0', i);
+            e.path = raw.substr(i, end - i);
+            i = end + 1;
+        } else {
+            e.path = raw.substr(i, namelen);
+            i += namelen + 1;
+        }
+        // pad to 8-byte boundary from entry start
+        std::size_t entry_end = ((i + 7) & ~7UL);
+        i = entry_end;
+        idx.entries_.push_back(std::move(e));
+    }
+    return idx;
+}
+
+void Index::write(const Repo& r) const {
+    std::string buf;
+    buf += "DIRC";
+    char tmp[4];
+    wu32(tmp, 2); buf.append(tmp, 4);
+    wu32(tmp, static_cast<std::uint32_t>(entries_.size())); buf.append(tmp, 4);
+
+    for (const auto& e : entries_) {
+        std::size_t base = buf.size();
+        char t[4];
+        wu32(t, e.ctime_s); buf.append(t, 4);
+        wu32(t, e.ctime_n); buf.append(t, 4);
+        wu32(t, e.mtime_s); buf.append(t, 4);
+        wu32(t, e.mtime_n); buf.append(t, 4);
+        wu32(t, e.dev);     buf.append(t, 4);
+        wu32(t, e.ino);     buf.append(t, 4);
+        wu32(t, e.mode);    buf.append(t, 4);
+        wu32(t, e.uid);     buf.append(t, 4);
+        wu32(t, e.gid);     buf.append(t, 4);
+        wu32(t, e.size);    buf.append(t, 4);
+        Sha1 raw = from_hex(e.sha_hex);
+        buf.append(reinterpret_cast<const char*>(raw.data()), 20);
+        std::uint16_t flags = static_cast<std::uint16_t>(
+            std::min<std::size_t>(e.path.size(), 0xFFF));
+        flags = htons(flags);
+        buf.append(reinterpret_cast<const char*>(&flags), 2);
+        buf += e.path;
+        buf += '\0';
+        std::size_t end = buf.size();
+        std::size_t padded = ((end - base + 7) & ~7UL) + base;
+        buf.resize(padded, '\0');
+    }
+
+    auto ck = sha1(buf);
+    buf.append(reinterpret_cast<const char*>(ck.data()), 20);
+
+    auto p = r.git_dir() / "index";
+    std::ofstream f{p, std::ios::binary};
+    f.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+}
+
+void Index::add(const IndexEntry& e) {
+    remove(e.path);
+    entries_.push_back(e);
+    std::sort(entries_.begin(), entries_.end(),
+              [](const IndexEntry& a, const IndexEntry& b) {
+                  return a.path < b.path;
+              });
+}
+
+void Index::remove(const std::string& path) {
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                  [&](const IndexEntry& e) {
+                                      return e.path == path;
+                                  }),
+                   entries_.end());
+}
+
+std::optional<IndexEntry> Index::find(const std::string& path) const {
+    for (const auto& e : entries_)
+        if (e.path == path) return e;
+    return std::nullopt;
+}
+
+IndexEntry stat_to_entry(const fs::path& abs, const std::string& rel,
+                         const std::string& sha_hex) {
+    struct ::stat st{};
+    ::stat(abs.c_str(), &st);
+    IndexEntry e;
+    e.ctime_s = static_cast<std::uint32_t>(st.st_ctime);
+    e.mtime_s = static_cast<std::uint32_t>(st.st_mtime);
+    e.dev     = static_cast<std::uint32_t>(st.st_dev);
+    e.ino     = static_cast<std::uint32_t>(st.st_ino);
+    e.mode    = (st.st_mode & 0111) ? 0100755 : 0100644;
+    e.uid     = st.st_uid; e.gid = st.st_gid;
+    e.size    = static_cast<std::uint32_t>(st.st_size);
+    e.sha_hex = sha_hex;
+    e.path    = rel;
+    return e;
+}
+
+}
+```
+
+## `add` and `commit`
+
+```cpp
+// In cmd.cpp
+
+int cmd_add(std::span<const std::string_view> args) {
+    if (args.empty()) { std::fprintf(stderr, "add: file required\n"); return 2; }
+    auto r    = Repo::discover();
+    auto root = r.git_dir().parent_path();
+    auto idx  = Index::read(r);
+
+    for (auto a : args) {
+        fs::path abs = fs::absolute(fs::path{std::string{a}});
+        std::string rel = fs::relative(abs, root).string();
+        std::ifstream f{abs, std::ios::binary};
+        std::ostringstream buf; buf << f.rdbuf();
+        auto sha = write_object(r, ObjType::Blob, buf.str());
+        idx.add(stat_to_entry(abs, rel, sha));
+    }
+    idx.write(r);
+    return 0;
+}
+
+int cmd_commit(std::span<const std::string_view> args) {
+    std::string msg;
+    for (std::size_t i = 0; i < args.size(); ++i)
+        if (args[i] == "-m" && i + 1 < args.size()) msg = std::string{args[++i]};
+    if (msg.empty()) { std::fprintf(stderr, "commit: -m message required\n"); return 2; }
+
+    auto r    = Repo::discover();
+    auto root = r.git_dir().parent_path();
+    auto idx  = Index::read(r);
+
+    // Build tree from index entries.
+    // Simple version: only single-level. Full version requires recursive build.
+    // We'll do the recursive approach via a helper.
+    auto tree_sha = index_to_tree(r, idx);
+
+    CommitInfo c;
+    c.tree_sha  = tree_sha;
+    c.message   = msg;
+    auto head   = resolve_ref(r, "HEAD");
+    if (head) c.parents.push_back(*head);
+
+    auto who = author_line(
+        std::getenv("GIT_AUTHOR_NAME")    ? std::getenv("GIT_AUTHOR_NAME")    : "you",
+        std::getenv("GIT_AUTHOR_EMAIL")   ? std::getenv("GIT_AUTHOR_EMAIL")   : "you@example.com"
+    );
+    c.author = c.committer = who;
+
+    auto sha = write_commit(r, c);
+
+    // Update HEAD (follow symref).
+    auto head_raw = read_head(r);
+    if (head_raw.starts_with("ref: ")) update_ref(r, head_raw.substr(5), sha);
+    else                               update_ref(r, "HEAD", sha);
+
+    std::cout << "[main " << sha.substr(0, 7) << "] " << msg << '\n';
+    return 0;
+}
+```
+
+The `index_to_tree` helper reconstructs the directory hierarchy from flat
+index paths:
+
+```cpp
+// src/tree.cpp (add this function)
+std::string index_to_tree(const Repo& r, const Index& idx) {
+    // group by first path component; recurse for subtrees
+    struct Dir {
+        std::vector<TreeEntry>     files;
+        std::map<std::string, Dir> dirs;
+    };
+
+    Dir root;
+    for (const auto& e : idx.entries()) {
+        fs::path p{e.path};
+        auto parts = std::vector<std::string>{};
+        for (const auto& seg : p) parts.push_back(seg.string());
+
+        Dir* cur = &root;
+        for (std::size_t i = 0; i + 1 < parts.size(); ++i)
+            cur = &cur->dirs[parts[i]];
+
+        std::string mode = (e.mode & 0111) ? "100755" : "100644";
+        cur->files.push_back({mode, parts.back(), e.sha_hex});
+    }
+
+    std::function<std::string(Dir&)> build = [&](Dir& d) -> std::string {
+        std::vector<TreeEntry> entries = d.files;
+        for (auto& [name, sub] : d.dirs) {
+            auto sub_sha = build(sub);
+            entries.push_back({"040000", name, sub_sha});
+        }
+        return write_object(r, ObjType::Tree, encode_tree(std::move(entries)));
+    };
+    return build(root);
+}
+```
+
+## `status`
+
+Compare HEAD tree → index → working tree.
+
+```cpp
+int cmd_status(std::span<const std::string_view>) {
+    auto r    = Repo::discover();
+    auto root = r.git_dir().parent_path();
+    auto idx  = Index::read(r);
+
+    // --- staged vs HEAD ---
+    std::map<std::string, std::string> head_blobs;  // path -> sha
+    auto head = resolve_ref(r, "HEAD");
+    if (head) {
+        auto co = decode_commit(read_object(r, *head).payload);
+        std::function<void(const std::string&, const std::string&)> walk;
+        walk = [&](const std::string& sha, const std::string& prefix) {
+            auto entries = decode_tree(read_object(r, sha).payload);
+            for (const auto& e : entries) {
+                std::string full = prefix.empty() ? e.name : prefix + "/" + e.name;
+                if (e.mode == "040000") walk(e.sha_hex, full);
+                else                    head_blobs[full] = e.sha_hex;
+            }
+        };
+        walk(co.tree_sha, "");
+    }
+
+    for (const auto& e : idx.entries()) {
+        auto it = head_blobs.find(e.path);
+        if (it == head_blobs.end())     std::cout << "A  " << e.path << '\n';
+        else if (it->second != e.sha_hex) std::cout << "M  " << e.path << '\n';
+        head_blobs.erase(e.path);
+    }
+    for (const auto& [p, _] : head_blobs)
+        std::cout << "D  " << p << '\n';
+
+    // --- working tree vs index ---
+    for (const auto& e : idx.entries()) {
+        auto abs = root / e.path;
+        if (!fs::exists(abs)) { std::cout << " D " << e.path << '\n'; continue; }
+        std::ifstream f{abs, std::ios::binary};
+        std::ostringstream buf; buf << f.rdbuf();
+        if (hash_object(ObjType::Blob, buf.str()) != e.sha_hex)
+            std::cout << " M " << e.path << '\n';
+    }
+    return 0;
+}
+```
+
+## `diff` — working tree vs index
+
+```cpp
+int cmd_diff(std::span<const std::string_view>) {
+    auto r    = Repo::discover();
+    auto root = r.git_dir().parent_path();
+    auto idx  = Index::read(r);
+
+    for (const auto& e : idx.entries()) {
+        auto abs = root / e.path;
+        if (!fs::exists(abs)) continue;
+        std::ifstream f{abs, std::ios::binary};
+        std::ostringstream buf; buf << f.rdbuf();
+        std::string wt = buf.str();
+        if (hash_object(ObjType::Blob, wt) == e.sha_hex) continue;
+
+        auto indexed = read_object(r, e.sha_hex).payload;
+
+        // Naive line-diff (LCS is an exercise).
+        std::cout << "--- a/" << e.path << "\n+++ b/" << e.path << "\n";
+        // Print every indexed line as '-', every working-tree line as '+'.
+        // Good enough to see what changed; proper Myers diff is the exercise.
+        auto lines = [](const std::string& s) {
+            std::vector<std::string> v; std::istringstream ss{s};
+            std::string l; while (std::getline(ss, l)) v.push_back(l);
+            return v;
+        };
+        for (const auto& l : lines(indexed)) std::cout << '-' << l << '\n';
+        for (const auto& l : lines(wt))      std::cout << '+' << l << '\n';
+    }
+    return 0;
+}
+```
+
+A real diff would implement Myers's algorithm. That's a good afternoon
+project; the naive dump above is enough to see changes.
+
+## Branches and `checkout`
+
+A branch is just a ref file. `checkout` reads the target commit's tree and
+writes every blob to disk, then updates HEAD.
+
+```cpp
+int cmd_branch(std::span<const std::string_view> args) {
+    auto r = Repo::discover();
+    if (args.empty()) {
+        // list
+        for (const auto& de : fs::directory_iterator(r.git_dir() / "refs" / "heads"))
+            std::cout << de.path().filename().string() << '\n';
+        return 0;
+    }
+    // create
+    auto sha = resolve_ref(r, "HEAD");
+    if (!sha) { std::fprintf(stderr, "branch: no commits yet\n"); return 2; }
+    update_ref(r, "refs/heads/" + std::string{args[0]}, *sha);
+    return 0;
+}
+
+int cmd_checkout(std::span<const std::string_view> args) {
+    if (args.empty()) { std::fprintf(stderr, "checkout: branch required\n"); return 2; }
+    auto r    = Repo::discover();
+    auto root = r.git_dir().parent_path();
+    auto ref  = "refs/heads/" + std::string{args[0]};
+    auto sha  = resolve_ref(r, ref);
+    if (!sha) { std::fprintf(stderr, "checkout: branch not found\n"); return 2; }
+
+    auto co   = decode_commit(read_object(r, *sha).payload);
+
+    // Write tree to disk.
+    std::function<void(const std::string&, const fs::path&)> checkout_tree;
+    checkout_tree = [&](const std::string& tree_sha, const fs::path& dir) {
+        auto entries = decode_tree(read_object(r, tree_sha).payload);
+        for (const auto& e : entries) {
+            auto dest = dir / e.name;
+            if (e.mode == "040000") {
+                fs::create_directories(dest);
+                checkout_tree(e.sha_hex, dest);
+            } else {
+                auto blob = read_object(r, e.sha_hex).payload;
+                std::ofstream f{dest, std::ios::binary};
+                f.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+                if (e.mode == "100755") fs::permissions(dest, fs::perms::owner_exec, fs::perm_options::add);
+            }
+        }
+    };
+    checkout_tree(co.tree_sha, root);
+
+    // Update HEAD to be a symbolic ref to the branch.
+    std::ofstream{r.git_dir() / "HEAD"} << "ref: " << ref << '\n';
+    std::cout << "Switched to branch '" << args[0] << "'\n";
+    return 0;
+}
+```
+
+## 3-way merge
+
+The algorithm: find the merge base (common ancestor), then for each file
+apply both diffs. If both sides changed the same lines, record a conflict.
+
+```cpp
+int cmd_merge(std::span<const std::string_view> args) {
+    if (args.empty()) { std::fprintf(stderr, "merge: branch required\n"); return 2; }
+    auto r    = Repo::discover();
+    auto root = r.git_dir().parent_path();
+
+    auto ours   = resolve_ref(r, "HEAD").value();
+    auto theirs = resolve_ref(r, "refs/heads/" + std::string{args[0]}).value();
+
+    if (ours == theirs) { std::cout << "Already up to date.\n"; return 0; }
+
+    // Find merge base via BFS on parent graph.
+    auto ancestors = [&](const std::string& start) {
+        std::set<std::string> seen;
+        std::queue<std::string> q; q.push(start);
+        while (!q.empty()) {
+            auto s = q.front(); q.pop();
+            if (!seen.insert(s).second) continue;
+            auto c = decode_commit(read_object(r, s).payload);
+            for (const auto& p : c.parents) q.push(p);
+        }
+        return seen;
+    };
+
+    auto ours_set   = ancestors(ours);
+    auto theirs_set = ancestors(theirs);
+
+    std::string base;
+    // Walk ours in BFS order; first one in theirs_set is LCA.
+    {
+        std::queue<std::string> q; q.push(ours);
+        std::set<std::string> visited;
+        while (!q.empty()) {
+            auto s = q.front(); q.pop();
+            if (!visited.insert(s).second) continue;
+            if (theirs_set.count(s)) { base = s; break; }
+            auto c = decode_commit(read_object(r, s).payload);
+            for (const auto& p : c.parents) q.push(p);
+        }
+    }
+
+    if (base.empty()) {
+        std::fprintf(stderr, "merge: no common ancestor (unrelated histories)\n");
+        return 2;
+    }
+
+    // Collect blob maps for base, ours, theirs.
+    auto tree_blobs = [&](const std::string& commit_sha) {
+        std::map<std::string, std::string> m;
+        auto tree = decode_commit(read_object(r, commit_sha).payload).tree_sha;
+        std::function<void(const std::string&, const std::string&)> walk;
+        walk = [&](const std::string& t, const std::string& pfx) {
+            for (const auto& e : decode_tree(read_object(r, t).payload)) {
+                std::string p = pfx.empty() ? e.name : pfx + "/" + e.name;
+                if (e.mode == "040000") walk(e.sha_hex, p);
+                else                    m[p] = e.sha_hex;
+            }
+        };
+        walk(tree, "");
+        return m;
+    };
+
+    auto base_m  = tree_blobs(base);
+    auto ours_m  = tree_blobs(ours);
+    auto theirs_m = tree_blobs(theirs);
+
+    bool conflict = false;
+    std::set<std::string> all_paths;
+    for (const auto& [p,_] : ours_m)   all_paths.insert(p);
+    for (const auto& [p,_] : theirs_m) all_paths.insert(p);
+
+    auto get = [](const auto& m, const std::string& k) -> std::string {
+        auto it = m.find(k); return it == m.end() ? "" : it->second;
+    };
+
+    Index idx = Index::read(r);
+    for (const auto& path : all_paths) {
+        auto b = get(base_m,   path);
+        auto o = get(ours_m,   path);
+        auto t = get(theirs_m, path);
+
+        if (o == t) continue;         // same on both sides, no action
+        if (o == b) {                  // we didn't change it — take theirs
+            if (t.empty()) {
+                fs::remove(root / path);
+                idx.remove(path);
+            } else {
+                auto blob = read_object(r, t).payload;
+                fs::create_directories((root / path).parent_path());
+                std::ofstream f{root / path, std::ios::binary};
+                f.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+                auto sha = write_object(r, ObjType::Blob, blob);
+                idx.add(stat_to_entry(root / path, path, sha));
+            }
+        } else if (t == b) {           // they didn't change it — keep ours
+            // nothing to do
+        } else {
+            std::cerr << "CONFLICT: " << path << '\n';
+            conflict = true;
+        }
+    }
+    idx.write(r);
+
+    if (!conflict) {
+        // Auto-commit the merge.
+        CommitInfo c;
+        c.tree_sha = index_to_tree(r, idx);
+        c.parents  = {ours, theirs};
+        auto who   = author_line("you", "you@example.com");
+        c.author = c.committer = who;
+        c.message = "Merge branch '" + std::string{args[0]} + "'";
+        auto sha  = write_commit(r, c);
+        auto head_raw = read_head(r);
+        if (head_raw.starts_with("ref: ")) update_ref(r, head_raw.substr(5), sha);
+        std::cout << "Merge made by 3-way.\n";
+    }
+    return conflict ? 1 : 0;
+}
+```
+
+## Wire everything up
+
+Add to `dispatch` in `cmd.cpp`:
+
+```cpp
+if (name == "add")      return cmd_add(args);
+if (name == "commit")   return cmd_commit(args);
+if (name == "status")   return cmd_status(args);
+if (name == "diff")     return cmd_diff(args);
+if (name == "branch")   return cmd_branch(args);
+if (name == "checkout") return cmd_checkout(args);
+if (name == "merge")    return cmd_merge(args);
+```
+
+## Try it
+
+```bash
+cmake --build build
+
+mkdir /tmp/git-demo && cd /tmp/git-demo
+mygit init
+echo "hello" > a.txt
+mygit add a.txt
+mygit commit -m "first"
+mygit branch feature
+mygit checkout feature
+echo "world" >> a.txt
+mygit add a.txt
+mygit commit -m "feature work"
+mygit checkout main
+mygit merge feature
+mygit log
+```
+
+## Exercises
+
+1. Implement Myers diff in `cmd_diff` and emit proper unified-diff output
+   with `@@ -a,b +c,d @@` hunks. Real `git diff` output is invaluable to
+   read while writing this.
+2. Implement `stash` and `stash pop` using the object store — a stash is
+   just a commit not reachable from any branch.
+3. Make `checkout` restore the index from the target commit, not just the
+   files.
+4. Implement `--abort` for `merge`: restore the working tree and index to
+   pre-merge state by recording the pre-merge HEAD somewhere.

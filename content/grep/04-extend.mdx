@@ -1,0 +1,344 @@
+---
+title: Extending — context, recursion, binary files, speed
+description: Context lines, recursive walking with ignores, binary-file handling, and buffered I/O.
+---
+
+# Extending mgrep
+
+This lesson is the set of features that separates a toy from a tool you'd
+actually type every day. Context lines, recursive directory handling with
+ignores, handling of binary files, and a bulk-I/O path for speed.
+
+## Context lines (`-A`, `-B`, `-C`)
+
+```
+mgrep -B 2 -A 1 pattern file
+```
+
+Prints 2 lines before each match and 1 after, separated by `--` between
+non-contiguous groups. Implementation: a ring buffer of the last N lines
+and a countdown after each match.
+
+### args.hpp additions
+
+```cpp
+int before = 0;
+int after  = 0;
+```
+
+### args.cpp parsing
+
+```cpp
+auto eat_int = [&](std::string_view flag) -> int {
+    // accept "-A5" or "-A 5"
+    if (flag.size() > 2) return std::stoi(std::string{flag.substr(2)});
+    if (i + 1 >= argc) usage();
+    return std::stoi(argv[++i]);
+};
+
+// inside the flag loop:
+if (s.starts_with("-A")) { a.after  = eat_int(s); continue; }
+if (s.starts_with("-B")) { a.before = eat_int(s); continue; }
+if (s.starts_with("-C")) { int n = eat_int(s); a.before = a.after = n; continue; }
+```
+
+### grep.cpp — the ring buffer
+
+```cpp
+#include <deque>
+
+int Grep::run_stream(std::istream& in, const std::string& name) {
+    std::string line;
+    std::size_t n = 0;
+    std::size_t count = 0;
+    std::vector<Range> ranges;
+
+    struct Pending { std::size_t lineno; std::string line; };
+    std::deque<Pending> before;
+    int after_left = 0;
+    std::size_t last_printed = 0;
+
+    auto emit = [&](std::size_t ln, const std::string& l,
+                    const std::vector<Range>& rs, bool is_match) {
+        if (args_.files.size() > 1 && last_printed != 0 && ln != last_printed + 1) {
+            std::cout << "--\n";
+        }
+        print_match_line(name, ln, l, is_match ? rs : std::vector<Range>{});
+        last_printed = ln;
+    };
+
+    while (std::getline(in, line)) {
+        ++n;
+        bool matched = matcher_.find_all(line, ranges);
+        if (args_.invert) matched = !matched;
+
+        if (matched) {
+            any_match_ = true;
+            ++count;
+            if (args_.names_only) { std::cout << name << '\n'; return 0; }
+            if (args_.count_only) continue;
+
+            for (auto& p : before) emit(p.lineno, p.line, {}, false);
+            before.clear();
+            emit(n, line, ranges, true);
+            after_left = args_.after;
+        } else if (after_left > 0) {
+            emit(n, line, {}, false);
+            --after_left;
+        } else if (args_.before > 0) {
+            before.push_back({n, line});
+            if (static_cast<int>(before.size()) > args_.before) before.pop_front();
+        }
+    }
+
+    if (args_.count_only) {
+        if (args_.files.size() > 1) std::cout << name << ':';
+        std::cout << count << '\n';
+    }
+    return 0;
+}
+```
+
+Test:
+
+```bash
+./build/mgrep -B 1 -A 1 'cherry' /tmp/fruits
+# banana
+# cherry
+# apricot
+```
+
+## Recursive walking with ignore patterns
+
+`-r` already walks a directory. Let's respect common ignores by default —
+`.git`, `node_modules`, `build` — and accept `--include`/`--exclude`.
+
+### args.hpp additions
+
+```cpp
+std::vector<std::string> include_glob;
+std::vector<std::string> exclude_glob;
+bool respect_default_ignores = true;
+```
+
+### glob matching
+
+Add a tiny glob-to-regex converter:
+
+```cpp
+// src/glob.cpp
+#include <regex>
+#include <string>
+
+namespace mgrep {
+
+std::regex glob_to_regex(std::string_view g) {
+    std::string r = "^";
+    for (char c : g) {
+        switch (c) {
+            case '*': r += "[^/]*"; break;
+            case '?': r += "[^/]";  break;
+            case '.': r += "\\.";   break;
+            default : r.push_back(c);
+        }
+    }
+    r += "$";
+    return std::regex{r};
+}
+
+}
+```
+
+### grep.cpp — filter the walk
+
+```cpp
+namespace {
+
+bool matches_any(const std::vector<std::regex>& res, const std::string& name) {
+    for (const auto& r : res) if (std::regex_search(name, r)) return true;
+    return false;
+}
+
+static const std::vector<std::string> kDefaultIgnores = {
+    ".git", ".svn", "node_modules", ".cache", "build", "dist", ".venv"
+};
+
+bool default_ignored(const std::string& filename) {
+    for (const auto& d : kDefaultIgnores) if (filename == d) return true;
+    return false;
+}
+
+}  // anon
+```
+
+Update the recursive walker:
+
+```cpp
+int Grep::run_file(const std::string& path) {
+    if (path == "-") return run_stream(std::cin, "(stdin)");
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto status = fs::status(path, ec);
+    if (ec) { std::perror(path.c_str()); return 2; }
+
+    if (fs::is_directory(status)) {
+        if (!args_.recursive) {
+            std::fprintf(stderr, "mgrep: %s: is a directory\n", path.c_str());
+            return 2;
+        }
+
+        std::vector<std::regex> inc, exc;
+        for (const auto& g : args_.include_glob) inc.push_back(glob_to_regex(g));
+        for (const auto& g : args_.exclude_glob) exc.push_back(glob_to_regex(g));
+
+        fs::recursive_directory_iterator it{path,
+            fs::directory_options::skip_permission_denied, ec}, endIt;
+        for (; it != endIt && !ec; it.increment(ec)) {
+            if (args_.respect_default_ignores && it->is_directory() &&
+                default_ignored(it->path().filename().string())) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (!it->is_regular_file()) continue;
+            auto fname = it->path().filename().string();
+            if (!exc.empty() && matches_any(exc, fname)) continue;
+            if (!inc.empty() && !matches_any(inc, fname)) continue;
+            run_file(it->path().string());
+        }
+        return 0;
+    }
+
+    std::ifstream f{path, std::ios::binary};
+    if (!f) { std::perror(path.c_str()); return 2; }
+    return run_stream(f, path);
+}
+```
+
+## Binary files
+
+Real `grep` detects binary files (by a zero byte in the first few KiB) and
+prints `Binary file X matches`. Add the same logic:
+
+```cpp
+namespace {
+bool looks_binary(std::istream& in) {
+    char buf[4096];
+    in.read(buf, sizeof(buf));
+    std::streamsize n = in.gcount();
+    for (std::streamsize i = 0; i < n; ++i) if (buf[i] == '\0') return true;
+    return false;
+}
+}
+```
+
+In `run_file`:
+
+```cpp
+if (looks_binary(f)) {
+    std::string line;
+    f.clear(); f.seekg(0);
+    // just test whether there's a match; don't stream content
+    while (std::getline(f, line)) {
+        std::vector<Range> rs;
+        if (matcher_.find_all(line, rs)) {
+            std::cout << "Binary file " << path << " matches\n";
+            any_match_ = true;
+            return 0;
+        }
+    }
+    return 0;
+}
+f.clear();
+f.seekg(0);
+return run_stream(f, path);
+```
+
+## Speed: a buffered read loop
+
+`std::getline` is reasonable but not peak. For large inputs, read in 64 KiB
+blocks and split on `\n`:
+
+```cpp
+int Grep::run_stream_fast(std::istream& in, const std::string& name) {
+    constexpr std::size_t kBuf = 64 * 1024;
+    std::string pending;
+    pending.reserve(kBuf);
+    std::vector<char> block(kBuf);
+    std::size_t n = 0;
+    std::vector<Range> ranges;
+
+    while (in) {
+        in.read(block.data(), block.size());
+        std::streamsize got = in.gcount();
+        if (got <= 0) break;
+
+        std::size_t start = 0;
+        for (std::streamsize i = 0; i < got; ++i) {
+            if (block[i] != '\n') continue;
+            pending.append(block.data() + start,
+                           static_cast<std::size_t>(i) - start);
+            start = static_cast<std::size_t>(i) + 1;
+            ++n;
+
+            bool matched = matcher_.find_all(pending, ranges);
+            if (args_.invert) matched = !matched;
+            if (matched) {
+                any_match_ = true;
+                if (args_.names_only) { std::cout << name << '\n'; return 0; }
+                if (!args_.count_only) print_match_line(name, n, pending, ranges);
+            }
+            pending.clear();
+        }
+        if (start < static_cast<std::size_t>(got)) {
+            pending.append(block.data() + start,
+                           static_cast<std::size_t>(got) - start);
+        }
+    }
+    // any dangling no-newline line:
+    if (!pending.empty()) {
+        ++n;
+        bool matched = matcher_.find_all(pending, ranges);
+        if (args_.invert) matched = !matched;
+        if (matched) {
+            any_match_ = true;
+            if (!args_.count_only) print_match_line(name, n, pending, ranges);
+        }
+    }
+    return 0;
+}
+```
+
+Benchmark. On a 500 MB log with a simple pattern, expect roughly 2–3× over
+`getline`-based code. If you want another 5×, swap in Boyer-Moore-Horspool
+for the literal path.
+
+## Stdin auto-detection
+
+If no files are given, read stdin. If stdin is a TTY and there are no files,
+exit with usage instead of hanging — that's what real `grep` does:
+
+```cpp
+#include <unistd.h>
+
+int Grep::run() {
+    if (args_.files.empty()) {
+        if (::isatty(STDIN_FILENO)) {
+            std::fprintf(stderr, "mgrep: no files, no stdin\n");
+            return 2;
+        }
+        return run_file("-");
+    }
+    for (const auto& p : args_.files) run_file(p);
+    return 0;
+}
+```
+
+## Exercises
+
+1. Add `--exclude-dir=DIR` for the recursive walker.
+2. Respect `.gitignore` when `-r` and inside a git repo. Parse the file and
+   turn patterns into globs.
+3. Support `gzip`ped input (detect `.gz` extension, open via `zlib`).
+4. Implement parallel file processing: with `-r` on many files, use a thread
+   pool to grep them in parallel. Be careful with output ordering.

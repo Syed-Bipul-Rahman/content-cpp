@@ -1,0 +1,273 @@
+---
+title: Ship — tests, benchmarks, packaging
+description: Test against real grep, benchmark on a large corpus, and package.
+---
+
+# Ship mgrep
+
+At this point `mgrep` does everything you'd want day-to-day: regex,
+context, recursion, ignores, color. The last mile is proving it correct
+and making it easy to distribute.
+
+## Test strategy
+
+The best oracle for a `grep` is real `grep`. Pipe the same input to both,
+compare outputs.
+
+### tests/run.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN=./build/mgrep
+REF=${GREP_REF:-grep}
+
+mkdir -p /tmp/mgrep-tests
+D=$(mktemp -d /tmp/mgrep-tests/XXXX)
+trap 'rm -rf "$D"' EXIT
+
+cat > "$D/a.txt" <<EOF
+apple
+Apricot
+banana
+cherry
+Foo bar
+fooBAR
+  indented foo
+# comment with foo
+EOF
+cat > "$D/b.txt" <<'EOF'
+def foo():
+    return 1
+class Foo(Bar):
+    pass
+EOF
+mkdir "$D/sub"
+cat > "$D/sub/c.txt" <<EOF
+nested foo
+nothing here
+EOF
+
+compare() {
+    local desc="$1"; shift
+    local mine ref rc_m rc_r
+    mine=$("$BIN"  "$@" 2>/dev/null; echo "__rc__$?") || true
+    ref=$("$REF"  "$@" 2>/dev/null; echo "__rc__$?") || true
+    mine_out="${mine%__rc__*}"; rc_m="${mine##*__rc__}"
+    ref_out="${ref%__rc__*}";   rc_r="${ref##*__rc__}"
+    if [[ "$mine_out" != "$ref_out" ]]; then
+        echo "FAIL: $desc"
+        diff <(echo "$mine_out") <(echo "$ref_out") || true
+        exit 1
+    fi
+    if [[ "$rc_m" != "$rc_r" ]]; then
+        echo "FAIL (rc): $desc (mine=$rc_m ref=$rc_r)"
+        exit 1
+    fi
+    echo "ok: $desc"
+}
+
+compare "literal match"   foo  "$D/a.txt"
+compare "-i"              -i foo "$D/a.txt"
+compare "-v"              -v foo "$D/a.txt"
+compare "-n"              -n foo "$D/a.txt"
+compare "-c"              -c foo "$D/a.txt"
+compare "-l (match)"      -l foo "$D/a.txt" "$D/b.txt"
+compare "-w"              -w foo "$D/a.txt"
+compare "-x"              -x banana "$D/a.txt"
+compare "-F brackets"     -F "[abc]" "$D/a.txt"
+compare "regex"           "^f" "$D/a.txt"
+compare "recurse"         -r foo "$D"
+
+echo "all pass"
+```
+
+Run it:
+
+```bash
+chmod +x tests/run.sh
+./tests/run.sh
+```
+
+Differences between our output and GNU grep are where you focus. Most of
+them will be edge cases — multiline CRLF, BRE vs ERE, locale-sensitive
+`[[:alpha:]]` classes. Pick the ones you care about, document the rest.
+
+### Unit tests for the matcher
+
+The matcher is pure; it's worth Catch2 unit tests:
+
+```cpp
+#include <catch2/catch.hpp>
+#include "matcher.hpp"
+
+using namespace mgrep;
+
+static Args make(const std::string& pat) { Args a; a.pattern = pat; return a; }
+
+TEST_CASE("literal match") {
+    Matcher m{make("foo")};
+    std::vector<Range> r;
+    REQUIRE(m.find_all("a foo bar foo", r));
+    REQUIRE(r.size() == 2);
+    REQUIRE(r[0].start == 2);
+    REQUIRE(r[1].start == 10);
+}
+
+TEST_CASE("regex") {
+    Args a = make("f.o"); a.extended = true;
+    Matcher m{a};
+    std::vector<Range> r;
+    REQUIRE(m.find_all("fao fzo foo", r));
+    REQUIRE(r.size() == 3);
+}
+
+TEST_CASE("whole word") {
+    Args a = make("foo"); a.whole_word = true;
+    Matcher m{a};
+    std::vector<Range> r;
+    REQUIRE(!m.find_all("food", r));
+    REQUIRE(m.find_all("foo", r));
+}
+```
+
+## Benchmark
+
+```bash
+# a big file
+seq 1 10000000 > /tmp/big.txt
+
+hyperfine --warmup 2 \
+  './build/mgrep 999 /tmp/big.txt' \
+  'grep 999 /tmp/big.txt' \
+  'rg 999 /tmp/big.txt'
+```
+
+Record your numbers in the README. The GNU `grep` number is your baseline;
+if you're within 3× without Boyer-Moore, that's a fair first cut. `ripgrep`
+is 20–50× faster than GNU — do not feel bad.
+
+To close the gap:
+
+1. Boyer-Moore-Horspool on literal patterns.
+2. `memchr` to skip to the next occurrence of the first pattern byte.
+3. `mmap` the file instead of reading.
+4. Skip UTF-8 validation unless asked.
+5. Don't allocate on the hot path. Reuse buffers. Use `std::string::clear()`.
+
+Each of those is a good afternoon exercise.
+
+## Man page
+
+Write one. It's 30 minutes and it's what unlocks distribution.
+
+```
+# mgrep.1
+.TH MGREP 1 "2025" "1.0" "mgrep manual"
+.SH NAME
+mgrep \- minimum grep
+.SH SYNOPSIS
+.B mgrep
+[\fIoptions\fR] \fIpattern\fR [\fIfile...\fR]
+.SH DESCRIPTION
+Print lines that match a pattern. See
+.BR grep (1)
+for the canonical behavior; mgrep is compatible with the common flags.
+.SH OPTIONS
+.TP
+.B \-i
+Ignore case.
+.TP
+.B \-v
+Invert match.
+...
+```
+
+Install it alongside the binary.
+
+## Packaging
+
+### CMake install
+
+```cmake
+install(TARGETS mgrep RUNTIME DESTINATION bin)
+install(FILES mgrep.1 DESTINATION share/man/man1)
+```
+
+```bash
+cmake -S . -B release -DCMAKE_BUILD_TYPE=Release
+cmake --build release -j
+sudo cmake --install release
+mgrep foo /etc/hosts
+man mgrep
+```
+
+### Static binary (Linux)
+
+```bash
+cmake -S . -B static -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc"
+cmake --build static -j
+strip static/mgrep
+```
+
+A ~300 KB portable binary. Ship it on GitHub Releases.
+
+### Homebrew / deb / rpm — only if you have a user
+
+Don't package before anyone asks. A `curl | sh` install script serves 99%
+of use cases.
+
+## CI
+
+```yaml
+# .github/workflows/ci.yml
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ grep
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: ./tests/run.sh
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install cmake grep
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: GREP_REF=ggrep ./tests/run.sh
+```
+
+Debug mode runs with ASan + UBSan. Any sanitizer failure fails CI.
+
+## Final checklist
+
+- [ ] All flags implemented: `-i -v -n -c -l -r -w -x -F -E -A -B -C`
+- [ ] Color output auto-detects TTY; respects `NO_COLOR`
+- [ ] Recursive walk skips `.git`/`node_modules` by default
+- [ ] Binary file detection works (tested on `/usr/bin/ls`)
+- [ ] `tests/run.sh` matches GNU grep on every case
+- [ ] Unit tests for the matcher pass
+- [ ] Benchmark numbers in README
+- [ ] Man page installed
+- [ ] CI green
+
+## What you've built
+
+About 800–1200 lines of C++. A `grep` you actually use — because it's
+yours, because it's fast enough, and because you finally understand why
+real `grep` behaves the way it does.
+
+## Where next
+
+- [Build Your Own Regex Engine](/projects/regex-engine) — replace the
+  `std::regex` guts with an NFA you wrote.
+- [Build Your Own Search Engine](/projects/search-engine) — grep scales to
+  one file; search engines index a billion.
+- [Build Your Own CLI Tool](/projects/cli-tool) — polish the argparse /
+  distribution story on a tool of your own choosing.

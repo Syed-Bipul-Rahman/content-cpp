@@ -1,0 +1,514 @@
+---
+title: Core — trees, commits, log
+description: Build trees from a directory, commit them, and walk the commit graph.
+---
+
+# Core: trees and commits
+
+Lesson 02 stored bytes. This lesson stores **structure**: directories
+become trees, and snapshots-with-history become commits. By the end you can
+take a snapshot of a directory, commit it, and `log` the history.
+
+We're skipping the index for now — that arrives in lesson 04 with `add` and
+`status`. Here we use a simpler `write-tree` that walks the working tree
+directly. This is exactly how `git write-tree` worked in v0.
+
+## The tree object format
+
+Each entry is:
+
+```
+<mode-as-ascii> SP <name> NUL <20-byte-binary-sha>
+```
+
+Entries are concatenated, sorted by name (with a small twist for
+directories — see below), no trailing separator. Modes are:
+
+| Mode | Meaning |
+| --- | --- |
+| `100644` | regular file |
+| `100755` | executable file |
+| `120000` | symlink (target stored in the blob) |
+| `040000` | subtree |
+
+### Sort order gotcha
+
+Git sorts entries as if every directory name had a trailing `/` — so
+`foo` (file) sorts after `foo` (directory if anything starts with `foo/`).
+In practice: append `/` when the entry is a tree, then sort, then strip it.
+We'll do that explicitly.
+
+## src/tree.hpp
+
+```cpp
+#pragma once
+#include "object.hpp"
+#include "repo.hpp"
+
+#include <filesystem>
+#include <string>
+#include <vector>
+
+namespace mygit {
+
+struct TreeEntry {
+    std::string mode;      // "100644", "100755", "040000", "120000"
+    std::string name;
+    std::string sha_hex;
+};
+
+// Encode/decode the binary tree payload.
+std::string  encode_tree(std::vector<TreeEntry> entries);    // sorts
+std::vector<TreeEntry> decode_tree(std::string_view payload);
+
+// Walk a directory, write blobs/subtrees, return the root tree's sha.
+std::string  write_tree(const Repo& r, const std::filesystem::path& dir);
+
+}
+```
+
+## src/tree.cpp
+
+```cpp
+#include "tree.hpp"
+#include "hex.hpp"
+
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+namespace mygit {
+
+std::string encode_tree(std::vector<TreeEntry> entries) {
+    // Sort with the directory-trailing-slash convention.
+    auto key = [](const TreeEntry& e) {
+        return e.mode == "040000" ? e.name + "/" : e.name;
+    };
+    std::sort(entries.begin(), entries.end(),
+              [&](const TreeEntry& a, const TreeEntry& b) {
+                  return key(a) < key(b);
+              });
+
+    std::ostringstream os;
+    for (const auto& e : entries) {
+        os << e.mode << ' ' << e.name << '\0';
+        Sha1 raw = from_hex(e.sha_hex);
+        os.write(reinterpret_cast<const char*>(raw.data()),
+                 static_cast<std::streamsize>(raw.size()));
+    }
+    return os.str();
+}
+
+std::vector<TreeEntry> decode_tree(std::string_view p) {
+    std::vector<TreeEntry> out;
+    std::size_t i = 0;
+    while (i < p.size()) {
+        std::size_t sp = p.find(' ', i);
+        std::size_t nul = p.find('\0', sp + 1);
+        if (sp == std::string_view::npos || nul == std::string_view::npos)
+            throw std::runtime_error("malformed tree");
+
+        TreeEntry e;
+        e.mode = std::string(p.substr(i, sp - i));
+        e.name = std::string(p.substr(sp + 1, nul - sp - 1));
+        if (nul + 1 + 20 > p.size()) throw std::runtime_error("short tree");
+        Sha1 raw{};
+        std::memcpy(raw.data(), p.data() + nul + 1, 20);
+        e.sha_hex = to_hex(raw);
+        out.push_back(std::move(e));
+        i = nul + 1 + 20;
+    }
+    return out;
+}
+
+static bool is_executable(const fs::path& p) {
+    auto perms = fs::status(p).permissions();
+    using fs::perms;
+    return (perms_(perms) & (perms::owner_exec | perms::group_exec | perms::others_exec))
+           != perms::none;
+}
+
+// Helper to silence the unused-name above on some toolchains:
+static fs::perms perms_(fs::perms p) { return p; }
+
+std::string write_tree(const Repo& r, const fs::path& dir) {
+    std::vector<TreeEntry> entries;
+    for (auto const& de : fs::directory_iterator(dir)) {
+        const auto& p = de.path();
+        auto name = p.filename().string();
+        if (name == ".git") continue;
+
+        if (de.is_directory()) {
+            auto sub = write_tree(r, p);
+            entries.push_back({"040000", name, sub});
+        } else if (de.is_regular_file()) {
+            std::ifstream f{p, std::ios::binary};
+            std::ostringstream buf; buf << f.rdbuf();
+            auto sha = write_object(r, ObjType::Blob, buf.str());
+            entries.push_back({is_executable(p) ? "100755" : "100644", name, sha});
+        } else if (de.is_symlink()) {
+            auto target = fs::read_symlink(p).string();
+            auto sha    = write_object(r, ObjType::Blob, target);
+            entries.push_back({"120000", name, sha});
+        }
+    }
+    return write_object(r, ObjType::Tree, encode_tree(std::move(entries)));
+}
+
+}
+```
+
+(The `is_executable` helper is small but a little awkward because of how
+`<filesystem>` exposes permission bits. Don't get fancy — match git's "any
+exec bit set" rule.)
+
+## Commits
+
+A commit's payload is plain text:
+
+```
+tree <sha>\n
+parent <sha>\n          (zero or more)
+author <name> <email> <unix-time> <tz>\n
+committer <name> <email> <unix-time> <tz>\n
+\n
+<message>
+```
+
+### src/commit.hpp
+
+```cpp
+#pragma once
+#include "repo.hpp"
+
+#include <string>
+#include <vector>
+
+namespace mygit {
+
+struct CommitInfo {
+    std::string tree_sha;
+    std::vector<std::string> parents;
+    std::string author;        // "Name <email> 1700000000 +0000"
+    std::string committer;     // same shape
+    std::string message;       // no trailing \n
+};
+
+std::string encode_commit(const CommitInfo& c);
+CommitInfo  decode_commit(std::string_view payload);
+
+// Convenience: form a "Name <email> <time> <tz>" identity line.
+std::string author_line(const std::string& name, const std::string& email);
+
+std::string write_commit(const Repo& r, const CommitInfo& c);
+
+}
+```
+
+### src/commit.cpp
+
+```cpp
+#include "commit.hpp"
+#include "object.hpp"
+
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
+
+namespace mygit {
+
+std::string author_line(const std::string& name, const std::string& email) {
+    auto now = std::chrono::system_clock::now();
+    auto sec = std::chrono::duration_cast<std::chrono::seconds>(
+                   now.time_since_epoch()).count();
+
+    // Time zone: use local offset.
+    std::time_t t = sec;
+    std::tm gm{}; std::tm lt{};
+    gmtime_r(&t, &gm);
+    localtime_r(&t, &lt);
+    long off = (lt.tm_hour - gm.tm_hour) * 3600 + (lt.tm_min - gm.tm_min) * 60;
+    if (lt.tm_mday != gm.tm_mday) off += (lt.tm_mday > gm.tm_mday ? 86400 : -86400);
+    char tz[8];
+    std::snprintf(tz, sizeof(tz), "%+03ld%02ld", off / 3600, std::abs((off % 3600) / 60));
+
+    std::ostringstream os;
+    os << name << " <" << email << "> " << sec << ' ' << tz;
+    return os.str();
+}
+
+std::string encode_commit(const CommitInfo& c) {
+    std::ostringstream os;
+    os << "tree " << c.tree_sha << '\n';
+    for (const auto& p : c.parents) os << "parent " << p << '\n';
+    os << "author "    << c.author    << '\n';
+    os << "committer " << c.committer << '\n';
+    os << '\n' << c.message;
+    if (!c.message.empty() && c.message.back() != '\n') os << '\n';
+    return os.str();
+}
+
+CommitInfo decode_commit(std::string_view p) {
+    CommitInfo c;
+    std::size_t i = 0;
+    while (i < p.size()) {
+        std::size_t nl = p.find('\n', i);
+        std::string_view line = p.substr(i, nl - i);
+        if (line.empty()) { i = nl + 1; break; }
+        if      (line.starts_with("tree "))      c.tree_sha = std::string(line.substr(5));
+        else if (line.starts_with("parent "))    c.parents.emplace_back(line.substr(7));
+        else if (line.starts_with("author "))    c.author    = std::string(line.substr(7));
+        else if (line.starts_with("committer ")) c.committer = std::string(line.substr(10));
+        i = nl + 1;
+    }
+    c.message = std::string(p.substr(i));
+    return c;
+}
+
+std::string write_commit(const Repo& r, const CommitInfo& c) {
+    return write_object(r, ObjType::Commit, encode_commit(c));
+}
+
+}
+```
+
+## Refs
+
+`HEAD` is a small text file. Either a symbolic ref (`ref: refs/heads/main`)
+or a raw SHA (detached). A branch ref is just a file with a SHA in it.
+
+### src/refs.hpp
+
+```cpp
+#pragma once
+#include "repo.hpp"
+#include <optional>
+#include <string>
+
+namespace mygit {
+
+// Resolves "HEAD" or "refs/heads/main" to a SHA, following symbolic refs.
+// Returns std::nullopt if the ref doesn't point anywhere yet (empty repo).
+std::optional<std::string> resolve_ref(const Repo& r, const std::string& ref);
+
+// Read the symbolic target of HEAD ("refs/heads/main") or the literal SHA if detached.
+std::string read_head(const Repo& r);   // returns "ref:..." or 40-char sha
+
+void update_ref(const Repo& r, const std::string& ref, const std::string& sha);
+
+}
+```
+
+### src/refs.cpp
+
+```cpp
+#include "refs.hpp"
+
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+namespace mygit {
+
+static std::string read_file(const fs::path& p) {
+    std::ifstream f{p};
+    if (!f) return {};
+    std::ostringstream b; b << f.rdbuf();
+    auto s = b.str();
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    return s;
+}
+
+std::string read_head(const Repo& r) {
+    return read_file(r.git_dir() / "HEAD");
+}
+
+std::optional<std::string> resolve_ref(const Repo& r, const std::string& ref) {
+    std::string cur = ref;
+    for (int hops = 0; hops < 8; ++hops) {
+        std::string val;
+        if (cur == "HEAD") val = read_file(r.git_dir() / "HEAD");
+        else               val = read_file(r.git_dir() / cur);
+        if (val.empty()) return std::nullopt;
+        if (val.starts_with("ref: ")) { cur = val.substr(5); continue; }
+        return val;
+    }
+    throw std::runtime_error("ref loop");
+}
+
+void update_ref(const Repo& r, const std::string& ref, const std::string& sha) {
+    auto path = r.git_dir() / ref;
+    fs::create_directories(path.parent_path());
+    std::ofstream{path} << sha << '\n';
+}
+
+}
+```
+
+## New subcommands
+
+### `write-tree`, `commit-tree`, `log`
+
+Add to `cmd.hpp`:
+
+```cpp
+int cmd_write_tree  (std::span<const std::string_view> args);
+int cmd_commit_tree (std::span<const std::string_view> args);
+int cmd_log         (std::span<const std::string_view> args);
+int cmd_ls_tree     (std::span<const std::string_view> args);
+```
+
+And in `cmd.cpp`:
+
+```cpp
+#include "commit.hpp"
+#include "refs.hpp"
+#include "tree.hpp"
+
+int cmd_write_tree(std::span<const std::string_view>) {
+    auto r = Repo::discover();
+    auto sha = write_tree(r, std::filesystem::current_path());
+    std::cout << sha << '\n';
+    return 0;
+}
+
+int cmd_commit_tree(std::span<const std::string_view> args) {
+    if (args.empty()) {
+        std::fprintf(stderr, "commit-tree: usage: <tree-sha> [-p parent]... -m msg\n");
+        return 2;
+    }
+    CommitInfo c;
+    c.tree_sha = std::string{args[0]};
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        if      (args[i] == "-p" && i + 1 < args.size()) { c.parents.emplace_back(args[++i]); }
+        else if (args[i] == "-m" && i + 1 < args.size()) { c.message = std::string{args[++i]}; }
+    }
+    auto r = Repo::discover();
+    auto who = author_line("you", "you@example.com");
+    c.author = c.committer = who;
+    auto sha = write_commit(r, c);
+    std::cout << sha << '\n';
+    return 0;
+}
+
+int cmd_ls_tree(std::span<const std::string_view> args) {
+    if (args.empty()) { std::fprintf(stderr, "ls-tree: usage: <tree-sha>\n"); return 2; }
+    auto r = Repo::discover();
+    auto obj = read_object(r, std::string{args[0]});
+    if (obj.type != ObjType::Tree) {
+        std::fprintf(stderr, "ls-tree: not a tree\n");
+        return 2;
+    }
+    auto entries = decode_tree(obj.payload);
+    for (const auto& e : entries) {
+        std::cout << e.mode << ' '
+                  << (e.mode == "040000" ? "tree" : "blob") << ' '
+                  << e.sha_hex << '\t' << e.name << '\n';
+    }
+    return 0;
+}
+
+int cmd_log(std::span<const std::string_view> args) {
+    auto r = Repo::discover();
+    std::string start;
+    if (!args.empty()) start = std::string{args[0]};
+    else {
+        auto head = resolve_ref(r, "HEAD");
+        if (!head) { std::fprintf(stderr, "log: empty repo\n"); return 0; }
+        start = *head;
+    }
+
+    std::string sha = start;
+    while (!sha.empty()) {
+        auto obj = read_object(r, sha);
+        if (obj.type != ObjType::Commit) break;
+        auto c = decode_commit(obj.payload);
+        std::cout << "commit " << sha << '\n'
+                  << "Author: " << c.author << "\n\n"
+                  << "    " << c.message << "\n\n";
+        if (c.parents.empty()) break;
+        sha = c.parents.front();    // first-parent walk
+    }
+    return 0;
+}
+```
+
+Wire into `dispatch`:
+
+```cpp
+if (name == "write-tree")  return cmd_write_tree(args);
+if (name == "commit-tree") return cmd_commit_tree(args);
+if (name == "ls-tree")     return cmd_ls_tree(args);
+if (name == "log")         return cmd_log(args);
+```
+
+## Try the full pipeline
+
+```bash
+cmake --build build
+
+mkdir /tmp/mygit-demo && cd /tmp/mygit-demo
+/path/to/mygit init
+
+echo "first" > a.txt
+mkdir d && echo "second" > d/b.txt
+
+TREE=$(/path/to/mygit write-tree)
+echo "tree=$TREE"
+
+# real git can read it
+git ls-tree $TREE
+# 100644 blob ... a.txt
+# 040000 tree ... d
+
+# our ls-tree
+/path/to/mygit ls-tree $TREE
+
+# first commit
+COMMIT=$(/path/to/mygit commit-tree $TREE -m "first commit")
+echo "ref: refs/heads/main" > .git/HEAD
+mkdir -p .git/refs/heads
+echo $COMMIT > .git/refs/heads/main
+
+# add another commit
+echo "third" >> a.txt
+TREE2=$(/path/to/mygit write-tree)
+COMMIT2=$(/path/to/mygit commit-tree $TREE2 -p $COMMIT -m "second commit")
+echo $COMMIT2 > .git/refs/heads/main
+
+# log!
+/path/to/mygit log
+```
+
+You should see two commits, newest first.
+
+For the third pipeline above we wrote `HEAD` and `refs/heads/main` by hand —
+that's because `commit` (which updates HEAD) is a lesson 04 feature. Once we
+have the index and `add`, the workflow becomes the familiar
+`add` → `commit`.
+
+## Cross-check with real git
+
+The whole point of doing this carefully:
+
+```bash
+git log $(/path/to/mygit log | head -1 | cut -d' ' -f2)
+```
+
+Real `git log` walks our objects and shows our commits. Our trees are
+encoded byte-for-byte the same. That's the whole spec.
+
+## Exercises
+
+1. `log --oneline` — print just `<short-sha> <subject>`.
+2. Walk *all* parents (merge commits have ≥2). Use a queue, dedupe by SHA.
+3. Implement `cat-file --pretty` for trees: print human-readable rows.
+4. Add `rev-parse <name>` that resolves a branch name or short SHA to a
+   full SHA.
