@@ -1,0 +1,668 @@
+---
+title: Extending — SQL parser, query executor, WAL, transactions
+description: A recursive-descent SQL parser, a tree-walking executor, write-ahead logging, and ACID transactions.
+---
+
+# Extending mydb
+
+Lesson 03 gave us raw row storage. This lesson adds the SQL front end and
+the correctness layer: a parser that understands `CREATE TABLE`, `INSERT`,
+and `SELECT`, an executor that calls the Table API, and a WAL that makes
+writes crash-safe.
+
+## SQL lexer
+
+### src/lexer.hpp
+
+```cpp
+#pragma once
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace db {
+
+enum class TK {
+    // Keywords
+    Select, From, Where, Insert, Into, Values, Create, Table,
+    Int, Text, Real, Primary, Key,
+    And, Or, Not, Null, Is,
+    // Symbols
+    Star, Comma, Semi, LParen, RParen, Eq, NEq, Lt, Gt, LEq, GEq,
+    // Literals
+    Ident, IntLit, StrLit, FloatLit,
+    End,
+};
+
+struct Token {
+    TK          kind;
+    std::string value;
+};
+
+std::vector<Token> lex_sql(std::string_view sql);
+
+}
+```
+
+### src/lexer.cpp
+
+```cpp
+#include "lexer.hpp"
+#include <cctype>
+#include <stdexcept>
+#include <unordered_map>
+
+namespace db {
+
+static const std::unordered_map<std::string, TK> kKeywords = {
+    {"SELECT",  TK::Select},  {"FROM",    TK::From},
+    {"WHERE",   TK::Where},   {"INSERT",  TK::Insert},
+    {"INTO",    TK::Into},    {"VALUES",  TK::Values},
+    {"CREATE",  TK::Create},  {"TABLE",   TK::Table},
+    {"INTEGER", TK::Int},     {"TEXT",    TK::Text},
+    {"REAL",    TK::Real},    {"PRIMARY", TK::Primary},
+    {"KEY",     TK::Key},     {"AND",     TK::And},
+    {"OR",      TK::Or},      {"NOT",     TK::Not},
+    {"NULL",    TK::Null},    {"IS",      TK::Is},
+};
+
+std::vector<Token> lex_sql(std::string_view s) {
+    std::vector<Token> out;
+    std::size_t i = 0;
+    while (i < s.size()) {
+        char c = s[i];
+        if (std::isspace(static_cast<unsigned char>(c))) { ++i; continue; }
+        if (c == '-' && i + 1 < s.size() && s[i+1] == '-') {
+            while (i < s.size() && s[i] != '\n') ++i; continue;
+        }
+        if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
+            std::size_t start = i;
+            while (i < s.size() && (std::isalnum(static_cast<unsigned char>(s[i])) || s[i] == '_')) ++i;
+            std::string w{s.substr(start, i - start)};
+            std::string upper = w;
+            for (auto& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            auto it = kKeywords.find(upper);
+            out.push_back({it != kKeywords.end() ? it->second : TK::Ident, w});
+            continue;
+        }
+        if (std::isdigit(static_cast<unsigned char>(c))) {
+            std::size_t start = i;
+            bool is_float = false;
+            while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) || s[i] == '.'))
+            { if (s[i] == '.') is_float = true; ++i; }
+            out.push_back({is_float ? TK::FloatLit : TK::IntLit, std::string{s.substr(start, i-start)}});
+            continue;
+        }
+        if (c == '\'') {
+            ++i;
+            std::string lit;
+            while (i < s.size() && s[i] != '\'') {
+                if (s[i] == '\\' && i + 1 < s.size()) { ++i; }
+                lit.push_back(s[i++]);
+            }
+            if (i < s.size()) ++i;
+            out.push_back({TK::StrLit, std::move(lit)});
+            continue;
+        }
+        switch (c) {
+            case '*': out.push_back({TK::Star,   "*"}); break;
+            case ',': out.push_back({TK::Comma,  ","}); break;
+            case ';': out.push_back({TK::Semi,   ";"}); break;
+            case '(': out.push_back({TK::LParen, "("}); break;
+            case ')': out.push_back({TK::RParen, ")"}); break;
+            case '=': out.push_back({TK::Eq,     "="}); break;
+            case '<': if (i+1<s.size()&&s[i+1]=='='){out.push_back({TK::LEq,"<="});++i;}
+                      else out.push_back({TK::Lt,"<"}); break;
+            case '>': if (i+1<s.size()&&s[i+1]=='='){out.push_back({TK::GEq,">="});++i;}
+                      else out.push_back({TK::Gt,">"}); break;
+            case '!': if (i+1<s.size()&&s[i+1]=='='){out.push_back({TK::NEq,"!="});++i;break;}
+                      [[fallthrough]];
+            default:
+                throw std::runtime_error(std::string{"unexpected character: "} + c);
+        }
+        ++i;
+    }
+    out.push_back({TK::End, ""});
+    return out;
+}
+
+}
+```
+
+## SQL parser
+
+### src/parser.hpp
+
+```cpp
+#pragma once
+#include "lexer.hpp"
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace db {
+
+// AST nodes
+struct ColDef { std::string name; std::string type; bool primary_key{false}; };
+
+struct CreateStmt {
+    std::string          table_name;
+    std::vector<ColDef>  columns;
+};
+
+struct Expr {
+    std::string col;
+    std::string op;     // = != < > <= >=
+    std::string val;
+};
+
+struct SelectStmt {
+    std::vector<std::string> columns;  // empty = *
+    std::string              table;
+    std::vector<Expr>        where;    // AND'd together
+};
+
+struct InsertStmt {
+    std::string              table;
+    std::vector<std::string> values;
+};
+
+struct Stmt {
+    std::variant<CreateStmt, SelectStmt, InsertStmt> v;
+};
+
+std::vector<Stmt> parse_sql(std::string_view sql);
+
+}
+```
+
+### src/parser.cpp
+
+```cpp
+#include "parser.hpp"
+#include <stdexcept>
+
+namespace db {
+
+class Parser {
+    std::vector<Token> toks_;
+    std::size_t pos_{0};
+
+    Token peek() const { return toks_[pos_]; }
+    Token advance() { return toks_[pos_++]; }
+    bool eat(TK k) { if (peek().kind == k) { advance(); return true; } return false; }
+    Token expect(TK k, const char* msg) {
+        if (peek().kind != k) throw std::runtime_error(msg);
+        return advance();
+    }
+
+public:
+    explicit Parser(std::string_view sql) : toks_{lex_sql(sql)} {}
+
+    std::vector<Stmt> parse_all() {
+        std::vector<Stmt> stmts;
+        while (peek().kind != TK::End) {
+            stmts.push_back(parse_stmt());
+            eat(TK::Semi);
+        }
+        return stmts;
+    }
+
+    Stmt parse_stmt() {
+        switch (peek().kind) {
+            case TK::Create: return parse_create();
+            case TK::Select: return parse_select();
+            case TK::Insert: return parse_insert();
+            default: throw std::runtime_error("expected statement");
+        }
+    }
+
+    Stmt parse_create() {
+        expect(TK::Create, "expected CREATE"); expect(TK::Table, "expected TABLE");
+        CreateStmt s;
+        s.table_name = expect(TK::Ident, "expected table name").value;
+        expect(TK::LParen, "expected (");
+        while (peek().kind != TK::RParen) {
+            ColDef cd;
+            cd.name = expect(TK::Ident, "expected column name").value;
+            auto t = advance();
+            if (t.kind == TK::Int)  cd.type = "INTEGER";
+            else if (t.kind == TK::Text) cd.type = "TEXT";
+            else if (t.kind == TK::Real) cd.type = "REAL";
+            else cd.type = "TEXT";
+            if (peek().kind == TK::Primary) {
+                advance(); expect(TK::Key, "expected KEY"); cd.primary_key = true;
+            }
+            s.columns.push_back(std::move(cd));
+            eat(TK::Comma);
+        }
+        expect(TK::RParen, "expected )");
+        return Stmt{std::move(s)};
+    }
+
+    Stmt parse_select() {
+        expect(TK::Select, "expected SELECT");
+        SelectStmt s;
+        if (eat(TK::Star)) { /* all columns */ }
+        else {
+            s.columns.push_back(expect(TK::Ident, "expected column").value);
+            while (eat(TK::Comma))
+                s.columns.push_back(expect(TK::Ident, "expected column").value);
+        }
+        expect(TK::From, "expected FROM");
+        s.table = expect(TK::Ident, "expected table").value;
+        if (eat(TK::Where)) {
+            s.where.push_back(parse_expr());
+            while (eat(TK::And)) s.where.push_back(parse_expr());
+        }
+        return Stmt{std::move(s)};
+    }
+
+    Expr parse_expr() {
+        Expr e;
+        e.col = expect(TK::Ident, "expected column").value;
+        auto op = advance();
+        switch (op.kind) {
+            case TK::Eq:  e.op = "=";  break;
+            case TK::NEq: e.op = "!="; break;
+            case TK::Lt:  e.op = "<";  break;
+            case TK::Gt:  e.op = ">";  break;
+            case TK::LEq: e.op = "<="; break;
+            case TK::GEq: e.op = ">="; break;
+            default: throw std::runtime_error("expected operator");
+        }
+        auto val = advance();
+        if (val.kind == TK::IntLit || val.kind == TK::FloatLit || val.kind == TK::StrLit)
+            e.val = val.value;
+        else if (val.kind == TK::Ident)
+            e.val = val.value;
+        else throw std::runtime_error("expected value");
+        return e;
+    }
+
+    Stmt parse_insert() {
+        expect(TK::Insert, "expected INSERT"); expect(TK::Into, "expected INTO");
+        InsertStmt s;
+        s.table = expect(TK::Ident, "expected table").value;
+        expect(TK::Values, "expected VALUES");
+        expect(TK::LParen, "expected (");
+        while (peek().kind != TK::RParen) {
+            auto v = advance();
+            s.values.push_back(v.value);
+            eat(TK::Comma);
+        }
+        expect(TK::RParen, "expected )");
+        return Stmt{std::move(s)};
+    }
+};
+
+std::vector<Stmt> parse_sql(std::string_view sql) {
+    return Parser{sql}.parse_all();
+}
+
+}
+```
+
+## Query executor
+
+The executor holds a map of `table_name → Table`. It executes AST nodes:
+
+```cpp
+// src/executor.hpp
+#pragma once
+#include "parser.hpp"
+#include "table.hpp"
+#include "pager.hpp"
+
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace db {
+
+struct ResultSet {
+    std::vector<std::string>              columns;
+    std::vector<std::vector<std::string>> rows;
+};
+
+class Executor {
+public:
+    explicit Executor(Pager& pager);
+
+    ResultSet execute(std::string_view sql);
+    void      exec_script(std::string_view sql);  // multiple stmts
+
+private:
+    Pager& pager_;
+    std::unordered_map<std::string, std::unique_ptr<Table>> tables_;
+
+    ResultSet exec_stmt(const Stmt& s);
+    ResultSet exec_create(const CreateStmt& s);
+    ResultSet exec_insert(const InsertStmt& s);
+    ResultSet exec_select(const SelectStmt& s);
+
+    bool eval_where(const std::vector<Expr>& where,
+                    const std::vector<std::string>& row,
+                    const Schema& schema) const;
+};
+
+}
+```
+
+```cpp
+// src/executor.cpp
+#include "executor.hpp"
+#include <stdexcept>
+#include <iostream>
+
+namespace db {
+
+Executor::Executor(Pager& pager) : pager_{pager} {}
+
+ResultSet Executor::execute(std::string_view sql) {
+    auto stmts = parse_sql(sql);
+    if (stmts.empty()) return {};
+    return exec_stmt(stmts.back());
+}
+
+void Executor::exec_script(std::string_view sql) {
+    for (const auto& s : parse_sql(sql)) exec_stmt(s);
+}
+
+ResultSet Executor::exec_stmt(const Stmt& s) {
+    return std::visit([&](const auto& v) -> ResultSet {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, CreateStmt>) return exec_create(v);
+        else if constexpr (std::is_same_v<T, InsertStmt>) return exec_insert(v);
+        else return exec_select(v);
+    }, s.v);
+}
+
+ResultSet Executor::exec_create(const CreateStmt& s) {
+    if (tables_.count(s.table_name))
+        throw std::runtime_error("table already exists: " + s.table_name);
+
+    Schema schema;
+    schema.table_name = s.table_name;
+    std::size_t offset = 0;
+    for (const auto& cd : s.columns) {
+        std::size_t sz = (cd.type == "INTEGER") ? 16 : (cd.type == "REAL") ? 16 : 64;
+        schema.columns.push_back({cd.name, cd.type, offset, sz});
+        offset += sz;
+    }
+    schema.row_size = offset;
+
+    std::uint32_t root = pager_.allocate();
+    init_leaf(pager_.get(root));
+    pager_.mark_dirty(root);
+
+    tables_[s.table_name] = std::make_unique<Table>(pager_, schema, root);
+    return {{"result"}, {{"ok"}}};
+}
+
+ResultSet Executor::exec_insert(const InsertStmt& s) {
+    auto it = tables_.find(s.table);
+    if (it == tables_.end()) throw std::runtime_error("no such table: " + s.table);
+    it->second->insert_row(s.values);
+    return {{"result"}, {{"ok"}}};
+}
+
+bool Executor::eval_where(const std::vector<Expr>& where,
+                           const std::vector<std::string>& row,
+                           const Schema& schema) const {
+    for (const auto& e : where) {
+        // Find column index.
+        std::size_t ci = 0;
+        bool found = false;
+        for (std::size_t i = 0; i < schema.columns.size(); ++i) {
+            if (schema.columns[i].name == e.col) { ci = i; found = true; break; }
+        }
+        if (!found) throw std::runtime_error("unknown column: " + e.col);
+        const auto& cell = row[ci];
+        bool pass = false;
+        if      (e.op == "=")  pass = cell == e.val;
+        else if (e.op == "!=") pass = cell != e.val;
+        else if (e.op == "<")  pass = cell < e.val;
+        else if (e.op == ">")  pass = cell > e.val;
+        else if (e.op == "<=") pass = cell <= e.val;
+        else if (e.op == ">=") pass = cell >= e.val;
+        if (!pass) return false;
+    }
+    return true;
+}
+
+ResultSet Executor::exec_select(const SelectStmt& s) {
+    auto it = tables_.find(s.table);
+    if (it == tables_.end()) throw std::runtime_error("no such table: " + s.table);
+    auto& tbl = *it->second;
+    const auto& schema = tbl.schema();
+
+    ResultSet rs;
+    rs.columns = s.columns.empty()
+        ? ([&]{ std::vector<std::string> c; for (auto& col : schema.columns) c.push_back(col.name); return c; }())
+        : s.columns;
+
+    for (const auto& row : tbl.scan()) {
+        if (!s.where.empty() && !eval_where(s.where, row, schema)) continue;
+        if (s.columns.empty()) {
+            rs.rows.push_back(row);
+        } else {
+            std::vector<std::string> projected;
+            for (const auto& cname : s.columns) {
+                for (std::size_t i = 0; i < schema.columns.size(); ++i) {
+                    if (schema.columns[i].name == cname) { projected.push_back(row[i]); break; }
+                }
+            }
+            rs.rows.push_back(std::move(projected));
+        }
+    }
+    return rs;
+}
+
+}
+```
+
+## Write-ahead log
+
+Before any page is written to disk, its new content is appended to the WAL.
+On crash, pages in the WAL that belong to committed transactions are
+replayed; uncommitted transactions are discarded.
+
+### src/wal.hpp
+
+```cpp
+#pragma once
+#include "page.hpp"
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace db {
+
+// One WAL frame: header + page data.
+struct WalFrame {
+    std::uint32_t page_no;
+    std::uint32_t txn_id;
+    std::uint8_t  committed;    // 1 = this frame ends a committed txn
+    std::uint8_t  padding[3];
+    std::uint8_t  data[PAGE_SIZE];
+};
+
+class Wal {
+public:
+    explicit Wal(const std::string& path);
+    ~Wal();
+
+    // Write a page to the WAL (as part of txn_id).
+    void  write_frame(std::uint32_t page_no, const std::uint8_t* data,
+                      std::uint32_t txn_id, bool commit);
+
+    // Find the latest committed version of page_no in the WAL.
+    // Returns nullptr if not present.
+    const std::uint8_t* read_page(std::uint32_t page_no) const;
+
+    // Apply all committed frames to the main database file fd.
+    void checkpoint(int db_fd);
+
+    // Clear the WAL after a checkpoint.
+    void reset();
+
+    std::uint32_t next_txn_id() const { return next_txn_id_; }
+
+private:
+    int            fd_{-1};
+    std::uint32_t  next_txn_id_{1};
+
+    // In-memory WAL cache: page_no -> latest committed data.
+    std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> cache_;
+
+    void replay();
+};
+
+}
+```
+
+### src/wal.cpp
+
+```cpp
+#include "wal.hpp"
+#include <cstring>
+#include <fcntl.h>
+#include <stdexcept>
+#include <unistd.h>
+
+namespace db {
+
+Wal::Wal(const std::string& path) {
+    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd_ < 0) throw std::runtime_error("cannot open WAL: " + path);
+    replay();
+}
+
+Wal::~Wal() { if (fd_ >= 0) ::close(fd_); }
+
+void Wal::write_frame(std::uint32_t page_no, const std::uint8_t* data,
+                      std::uint32_t txn_id, bool commit) {
+    WalFrame f{};
+    f.page_no   = page_no;
+    f.txn_id    = txn_id;
+    f.committed = commit ? 1 : 0;
+    std::memcpy(f.data, data, PAGE_SIZE);
+    ::lseek(fd_, 0, SEEK_END);
+    ::write(fd_, &f, sizeof(f));
+    ::fsync(fd_);
+    if (commit) cache_[page_no].assign(data, data + PAGE_SIZE);
+}
+
+const std::uint8_t* Wal::read_page(std::uint32_t page_no) const {
+    auto it = cache_.find(page_no);
+    if (it == cache_.end()) return nullptr;
+    return it->second.data();
+}
+
+void Wal::replay() {
+    off_t sz = ::lseek(fd_, 0, SEEK_END);
+    if (sz <= 0) return;
+    ::lseek(fd_, 0, SEEK_SET);
+
+    // Two passes: first collect committed txn ids, then apply committed frames.
+    std::vector<WalFrame> frames;
+    WalFrame f{};
+    while (::read(fd_, &f, sizeof(f)) == static_cast<ssize_t>(sizeof(f)))
+        frames.push_back(f);
+
+    // Collect committed txn ids.
+    std::unordered_map<std::uint32_t, bool> committed;
+    for (const auto& fr : frames)
+        if (fr.committed) committed[fr.txn_id] = true;
+
+    for (const auto& fr : frames) {
+        if (committed.count(fr.txn_id))
+            cache_[fr.page_no].assign(fr.data, fr.data + PAGE_SIZE);
+        next_txn_id_ = std::max(next_txn_id_, fr.txn_id + 1);
+    }
+}
+
+void Wal::checkpoint(int db_fd) {
+    for (const auto& [page_no, data] : cache_) {
+        off_t off = static_cast<off_t>(page_no) * PAGE_SIZE;
+        ::pwrite(db_fd, data.data(), PAGE_SIZE, off);
+    }
+    ::fsync(db_fd);
+}
+
+void Wal::reset() {
+    cache_.clear();
+    ::ftruncate(fd_, 0);
+}
+
+}
+```
+
+## Final main.cpp — interactive SQL REPL
+
+```cpp
+#include "executor.hpp"
+#include "pager.hpp"
+#include <iostream>
+#include <string>
+
+int main(int argc, char** argv) {
+    std::string db_path = argc > 1 ? argv[1] : "mydb.db";
+    db::Pager pager{db_path, true};
+    db::Executor exec{pager};
+
+    std::string line;
+    std::cout << "mydb> ";
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) { std::cout << "mydb> "; continue; }
+        try {
+            auto rs = exec.execute(line);
+            if (!rs.columns.empty()) {
+                for (const auto& c : rs.columns)
+                    std::cout << c << '\t';
+                std::cout << '\n';
+                for (const auto& row : rs.rows) {
+                    for (const auto& v : row) std::cout << v << '\t';
+                    std::cout << '\n';
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "error: " << e.what() << '\n';
+        }
+        std::cout << "mydb> ";
+    }
+}
+```
+
+## Try it
+
+```bash
+cmake --build build
+./build/mydb test.db
+mydb> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+mydb> INSERT INTO users VALUES (1, 'Alice', 30);
+mydb> INSERT INTO users VALUES (2, 'Bob', 25);
+mydb> INSERT INTO users VALUES (3, 'Carol', 35);
+mydb> SELECT * FROM users;
+# id    name    age
+# 1     Alice   30
+# 2     Bob     25
+# 3     Carol   35
+mydb> SELECT name FROM users WHERE age > 28;
+# name
+# Alice
+# Carol
+```
+
+## Exercises
+
+1. Add `DELETE FROM table WHERE ...` by marking rows as tombstones in the
+   leaf (set a flag byte) and filtering them out during scan.
+2. Add `UPDATE table SET col = val WHERE ...`.
+3. Wire the WAL into the pager so every `mark_dirty` + `flush` writes to
+   the WAL first.
+4. Implement `BEGIN`, `COMMIT`, `ROLLBACK` using the WAL's txn_id to group
+   writes and discard uncommitted ones on crash.

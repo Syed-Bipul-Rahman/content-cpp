@@ -1,0 +1,603 @@
+---
+title: "Core — B+ tree: search, insert, split"
+description: Implement a B+ tree with leaf and internal nodes, point lookup, range scan, and node splitting.
+---
+
+# Core: B+ tree
+
+The B+ tree is the heart of the database. Every row lives in a leaf node.
+Every lookup walks from root to leaf. Every insert may split a node and
+propagate upward. This lesson builds all three operations.
+
+## Node layout
+
+Each B+ tree page starts with a header, followed by either key/pointer
+pairs (internal) or key/value pairs (leaf).
+
+```
+Bytes 0–0:   PageType (always BTree = 1)
+Bytes 1–1:   node_type (0 = internal, 1 = leaf)
+Bytes 2–3:   num_keys  (uint16)
+Bytes 4–7:   right_sibling (uint32, leaves only; NULL_PAGE for rightmost)
+Bytes 8–11:  parent (uint32; NULL_PAGE for root)
+Bytes 12–15: (padding / reserved)
+Bytes 16+:   cells
+```
+
+### Internal node cell: `[key: uint64][child: uint32]` = 12 bytes
+
+An internal node with N keys has N+1 children. The layout:
+
+```
+[child_0][key_0][child_1][key_1]...[key_{N-1}][child_N]
+```
+
+We store it as a leading child pointer then alternating key/child pairs.
+With a 4096-byte page and 12-byte cells:
+
+- Header: 16 bytes
+- Leading child pointer: 4 bytes
+- Remaining: 4076 bytes
+- Each key+child pair: 12 bytes
+- Max keys per internal node: 4076 / 12 = 339
+
+### Leaf node cell: `[key: uint64][value_len: uint16][value: N bytes]`
+
+Fixed-size rows simplify the split logic enormously. We'll use a fixed
+value size set per table at create time.
+
+For illustration: if values are 64 bytes, each cell is 74 bytes.
+- Available: 4080 bytes
+- Max cells per leaf: 4080 / 74 = 55
+
+## src/btree.hpp
+
+```cpp
+#pragma once
+#include "page.hpp"
+#include "pager.hpp"
+
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace db {
+
+constexpr std::size_t BTREE_HEADER = 16;
+constexpr std::size_t KEY_SIZE     = 8;   // uint64
+
+// Layout helpers read/write directly into page bytes.
+struct BTreeHeader {
+    PageType     page_type;    // offset 0
+    std::uint8_t node_type;    // 0=internal 1=leaf; offset 1
+    std::uint16_t num_keys;    // offset 2
+    std::uint32_t sibling;     // right sibling (leaves); offset 4
+    std::uint32_t parent;      // offset 8
+    std::uint32_t reserved;    // offset 12
+};
+static_assert(sizeof(BTreeHeader) == BTREE_HEADER);
+
+class BTree {
+public:
+    BTree(Pager& pager, std::uint32_t root, std::size_t value_size);
+
+    // Point lookup. Returns the value bytes or nullopt.
+    std::optional<std::vector<std::uint8_t>> find(std::uint64_t key);
+
+    // Insert key/value. Overwrites if key exists.
+    void insert(std::uint64_t key, const std::uint8_t* value, std::size_t vlen);
+
+    // Range scan: calls cb(key, value) for every key in [lo, hi].
+    void range(std::uint64_t lo, std::uint64_t hi,
+               const std::function<void(std::uint64_t,
+                                        const std::uint8_t*, std::size_t)>& cb);
+
+    std::uint32_t root() const { return root_; }
+
+private:
+    Pager&        pager_;
+    std::uint32_t root_;
+    std::size_t   val_size_;
+    std::size_t   cell_size_;   // KEY_SIZE + 2 + val_size_
+    std::size_t   max_leaf_cells_;
+    std::size_t   max_internal_keys_;
+
+    // Navigate to the leaf that would contain `key`.
+    std::uint32_t find_leaf(std::uint64_t key);
+
+    // Read/write helpers for leaf cells.
+    std::uint64_t leaf_key(const std::uint8_t* page, std::size_t i) const;
+    const std::uint8_t* leaf_val(const std::uint8_t* page, std::size_t i) const;
+    std::uint8_t*       leaf_val_mut(std::uint8_t* page, std::size_t i);
+    void set_leaf_cell(std::uint8_t* page, std::size_t i,
+                       std::uint64_t key,
+                       const std::uint8_t* val);
+
+    // Splitting.
+    void split_leaf    (std::uint32_t leaf_pg);
+    void split_internal(std::uint32_t node_pg);
+    void insert_into_parent(std::uint32_t left, std::uint64_t key, std::uint32_t right);
+
+    // Internal node helpers.
+    std::uint64_t internal_key(const std::uint8_t* page, std::size_t i) const;
+    std::uint32_t internal_child(const std::uint8_t* page, std::size_t i) const;
+    void set_internal_key(std::uint8_t* page, std::size_t i, std::uint64_t k);
+    void set_internal_child(std::uint8_t* page, std::size_t i, std::uint32_t c);
+};
+
+// Initialize a new empty leaf page.
+void init_leaf(std::uint8_t* page, std::uint32_t parent = NULL_PAGE);
+// Initialize a new empty internal page.
+void init_internal(std::uint8_t* page, std::uint32_t first_child,
+                   std::uint32_t parent = NULL_PAGE);
+
+}
+```
+
+## src/btree.cpp
+
+```cpp
+#include "btree.hpp"
+#include <algorithm>
+#include <cassert>
+#include <cstring>
+
+namespace db {
+
+// ---- Page layout accessors ----
+
+static BTreeHeader* hdr(std::uint8_t* p) {
+    return reinterpret_cast<BTreeHeader*>(p);
+}
+static const BTreeHeader* hdr(const std::uint8_t* p) {
+    return reinterpret_cast<const BTreeHeader*>(p);
+}
+
+void init_leaf(std::uint8_t* page, std::uint32_t parent) {
+    std::memset(page, 0, PAGE_SIZE);
+    auto* h = hdr(page);
+    h->page_type = PageType::BTree;
+    h->node_type = 1;
+    h->num_keys  = 0;
+    h->sibling   = NULL_PAGE;
+    h->parent    = parent;
+}
+
+void init_internal(std::uint8_t* page, std::uint32_t first_child,
+                   std::uint32_t parent) {
+    std::memset(page, 0, PAGE_SIZE);
+    auto* h = hdr(page);
+    h->page_type = PageType::BTree;
+    h->node_type = 0;
+    h->num_keys  = 0;
+    h->parent    = parent;
+    // Store first child pointer at BTREE_HEADER.
+    std::memcpy(page + BTREE_HEADER, &first_child, 4);
+}
+
+// ---- Leaf helpers ----
+// Cell layout: [key:8][value:val_size_]
+// (We skip the value_len field for fixed-size rows.)
+
+std::uint64_t BTree::leaf_key(const std::uint8_t* page, std::size_t i) const {
+    std::uint64_t k;
+    std::memcpy(&k, page + BTREE_HEADER + i * cell_size_, 8);
+    return k;
+}
+const std::uint8_t* BTree::leaf_val(const std::uint8_t* page, std::size_t i) const {
+    return page + BTREE_HEADER + i * cell_size_ + 8;
+}
+std::uint8_t* BTree::leaf_val_mut(std::uint8_t* page, std::size_t i) {
+    return page + BTREE_HEADER + i * cell_size_ + 8;
+}
+void BTree::set_leaf_cell(std::uint8_t* page, std::size_t i,
+                          std::uint64_t key, const std::uint8_t* val) {
+    auto* cell = page + BTREE_HEADER + i * cell_size_;
+    std::memcpy(cell, &key, 8);
+    std::memcpy(cell + 8, val, val_size_);
+}
+
+// ---- Internal helpers ----
+// Layout after header: [child_0:4][key_0:8][child_1:4][key_1:8]...
+// child i is at offset BTREE_HEADER + i*12
+// key  i is at offset BTREE_HEADER + i*12 + 4
+
+std::uint32_t BTree::internal_child(const std::uint8_t* page, std::size_t i) const {
+    std::uint32_t c;
+    std::memcpy(&c, page + BTREE_HEADER + i * 12, 4);
+    return c;
+}
+std::uint64_t BTree::internal_key(const std::uint8_t* page, std::size_t i) const {
+    std::uint64_t k;
+    std::memcpy(&k, page + BTREE_HEADER + i * 12 + 4, 8);
+    return k;
+}
+void BTree::set_internal_child(std::uint8_t* page, std::size_t i, std::uint32_t c) {
+    std::memcpy(page + BTREE_HEADER + i * 12, &c, 4);
+}
+void BTree::set_internal_key(std::uint8_t* page, std::size_t i, std::uint64_t k) {
+    std::memcpy(page + BTREE_HEADER + i * 12 + 4, &k, 8);
+}
+
+// ---- Constructor ----
+
+BTree::BTree(Pager& pager, std::uint32_t root, std::size_t value_size)
+    : pager_{pager}, root_{root}, val_size_{value_size},
+      cell_size_{KEY_SIZE + value_size}
+{
+    max_leaf_cells_    = (PAGE_SIZE - BTREE_HEADER) / cell_size_;
+    max_internal_keys_ = (PAGE_SIZE - BTREE_HEADER - 4) / 12;
+}
+
+// ---- Search ----
+
+std::uint32_t BTree::find_leaf(std::uint64_t key) {
+    std::uint32_t pg = root_;
+    while (true) {
+        const auto* page = pager_.get(pg);
+        if (hdr(page)->node_type == 1) return pg;  // leaf
+        std::size_t n = hdr(page)->num_keys;
+        // Binary search for the child to descend into.
+        std::size_t i = 0;
+        while (i < n && key >= internal_key(page, i)) ++i;
+        pg = internal_child(page, i);
+    }
+}
+
+std::optional<std::vector<std::uint8_t>> BTree::find(std::uint64_t key) {
+    std::uint32_t pg = find_leaf(key);
+    const auto* page = pager_.get(pg);
+    std::size_t n = hdr(page)->num_keys;
+    // Binary search within the leaf.
+    std::size_t lo = 0, hi = n;
+    while (lo < hi) {
+        std::size_t mid = (lo + hi) / 2;
+        std::uint64_t k = leaf_key(page, mid);
+        if      (k == key) {
+            std::vector<std::uint8_t> v(val_size_);
+            std::memcpy(v.data(), leaf_val(page, mid), val_size_);
+            return v;
+        } else if (k < key) lo = mid + 1;
+        else                 hi = mid;
+    }
+    return std::nullopt;
+}
+
+// ---- Range scan ----
+
+void BTree::range(std::uint64_t lo, std::uint64_t hi,
+                  const std::function<void(std::uint64_t,
+                                           const std::uint8_t*, std::size_t)>& cb) {
+    std::uint32_t pg = find_leaf(lo);
+    while (pg != NULL_PAGE) {
+        const auto* page = pager_.get(pg);
+        std::size_t n = hdr(page)->num_keys;
+        for (std::size_t i = 0; i < n; ++i) {
+            std::uint64_t k = leaf_key(page, i);
+            if (k > hi) return;
+            if (k >= lo) cb(k, leaf_val(page, i), val_size_);
+        }
+        pg = hdr(page)->sibling;
+    }
+}
+
+// ---- Insert ----
+
+void BTree::insert(std::uint64_t key, const std::uint8_t* value, std::size_t vlen) {
+    assert(vlen == val_size_);
+    std::uint32_t leaf_pg = find_leaf(key);
+    auto* page = pager_.get(leaf_pg);
+    std::size_t n = hdr(page)->num_keys;
+
+    // Find insertion position (sorted order).
+    std::size_t pos = 0;
+    while (pos < n && leaf_key(page, pos) < key) ++pos;
+
+    // Overwrite if key already exists.
+    if (pos < n && leaf_key(page, pos) == key) {
+        std::memcpy(leaf_val_mut(page, pos), value, val_size_);
+        pager_.mark_dirty(leaf_pg);
+        return;
+    }
+
+    if (n < max_leaf_cells_) {
+        // Shift cells right and insert.
+        for (std::size_t i = n; i > pos; --i) {
+            auto* dst = page + BTREE_HEADER + i * cell_size_;
+            auto* src = page + BTREE_HEADER + (i - 1) * cell_size_;
+            std::memmove(dst, src, cell_size_);
+        }
+        set_leaf_cell(page, pos, key, value);
+        hdr(page)->num_keys = static_cast<std::uint16_t>(n + 1);
+        pager_.mark_dirty(leaf_pg);
+    } else {
+        // Leaf is full; insert into overflow then split.
+        // Temporarily store in a scratch buffer that holds n+1 cells.
+        std::vector<std::uint8_t> scratch((n + 1) * cell_size_);
+        std::memcpy(scratch.data(), page + BTREE_HEADER, n * cell_size_);
+        // Insert at pos.
+        std::memmove(scratch.data() + (pos + 1) * cell_size_,
+                     scratch.data() + pos * cell_size_,
+                     (n - pos) * cell_size_);
+        std::memcpy(scratch.data() + pos * cell_size_, &key, 8);
+        std::memcpy(scratch.data() + pos * cell_size_ + 8, value, val_size_);
+
+        // Split: left keeps floor((n+1)/2), right gets the rest.
+        std::size_t left_n  = (n + 1) / 2;
+        std::size_t right_n = (n + 1) - left_n;
+
+        // Rewrite the existing page as the left node.
+        std::memcpy(page + BTREE_HEADER, scratch.data(), left_n * cell_size_);
+        hdr(page)->num_keys = static_cast<std::uint16_t>(left_n);
+        pager_.mark_dirty(leaf_pg);
+
+        // Allocate right node.
+        std::uint32_t right_pg = pager_.allocate();
+        auto* rp = pager_.get(right_pg);
+        init_leaf(rp, hdr(page)->parent);
+        std::memcpy(rp + BTREE_HEADER,
+                    scratch.data() + left_n * cell_size_,
+                    right_n * cell_size_);
+        hdr(rp)->num_keys = static_cast<std::uint16_t>(right_n);
+        hdr(rp)->sibling  = hdr(page)->sibling;
+        hdr(page)->sibling = right_pg;
+        pager_.mark_dirty(right_pg);
+
+        // Promote the smallest key of the right node to the parent.
+        std::uint64_t promote = leaf_key(rp, 0);
+        insert_into_parent(leaf_pg, promote, right_pg);
+    }
+}
+
+void BTree::insert_into_parent(std::uint32_t left, std::uint64_t key,
+                                std::uint32_t right) {
+    const auto* lp = pager_.get(left);
+    std::uint32_t parent_pg = hdr(lp)->parent;
+
+    if (parent_pg == NULL_PAGE) {
+        // Left is the root; create a new root.
+        std::uint32_t new_root = pager_.allocate();
+        auto* rp = pager_.get(new_root);
+        init_internal(rp, left, NULL_PAGE);
+        // Insert key + right child.
+        set_internal_key(rp, 0, key);
+        set_internal_child(rp, 1, right);
+        hdr(rp)->num_keys = 1;
+        pager_.mark_dirty(new_root);
+
+        // Update parent pointers.
+        hdr(pager_.get(left))->parent  = new_root; pager_.mark_dirty(left);
+        hdr(pager_.get(right))->parent = new_root; pager_.mark_dirty(right);
+        root_ = new_root;
+        // Update meta page.
+        auto* meta = reinterpret_cast<MetaPage*>(pager_.get(0));
+        meta->root_page = root_;
+        pager_.mark_dirty(0);
+        return;
+    }
+
+    auto* pp = pager_.get(parent_pg);
+    std::size_t n = hdr(pp)->num_keys;
+
+    // Find where to insert key in parent.
+    std::size_t pos = 0;
+    while (pos < n && internal_key(pp, pos) < key) ++pos;
+
+    if (n < max_internal_keys_) {
+        // Shift keys and children right.
+        for (std::size_t i = n; i > pos; --i) {
+            set_internal_key(pp, i, internal_key(pp, i - 1));
+            set_internal_child(pp, i + 1, internal_child(pp, i));
+        }
+        set_internal_key(pp, pos, key);
+        set_internal_child(pp, pos + 1, right);
+        hdr(pp)->num_keys = static_cast<std::uint16_t>(n + 1);
+        hdr(pager_.get(right))->parent = parent_pg;
+        pager_.mark_dirty(parent_pg);
+        pager_.mark_dirty(right);
+    } else {
+        split_internal(parent_pg);
+        // Re-find the correct parent after the split and retry.
+        insert_into_parent(left, key, right);
+    }
+}
+
+void BTree::split_internal(std::uint32_t node_pg) {
+    auto* page = pager_.get(node_pg);
+    std::size_t n = hdr(page)->num_keys;
+    std::size_t mid = n / 2;
+
+    std::uint32_t right_pg = pager_.allocate();
+    auto* rp = pager_.get(right_pg);
+    init_internal(rp, internal_child(page, mid + 1), hdr(page)->parent);
+
+    for (std::size_t i = 0; i < n - mid - 1; ++i) {
+        set_internal_key(rp, i, internal_key(page, mid + 1 + i));
+        set_internal_child(rp, i + 1, internal_child(page, mid + 2 + i));
+    }
+    hdr(rp)->num_keys = static_cast<std::uint16_t>(n - mid - 1);
+    pager_.mark_dirty(right_pg);
+
+    std::uint64_t promote = internal_key(page, mid);
+    hdr(page)->num_keys = static_cast<std::uint16_t>(mid);
+    pager_.mark_dirty(node_pg);
+
+    insert_into_parent(node_pg, promote, right_pg);
+}
+
+}
+```
+
+## Row storage on top of BTree
+
+A table assigns auto-incrementing integer keys (rowids) to rows and stores
+serialized row data as the B+ tree value.
+
+### src/table.hpp
+
+```cpp
+#pragma once
+#include "btree.hpp"
+#include "pager.hpp"
+
+#include <string>
+#include <vector>
+
+namespace db {
+
+struct Column {
+    std::string name;
+    std::string type;   // "INTEGER" | "TEXT" | "REAL"
+    std::size_t offset; // byte offset in the fixed-size row buffer
+    std::size_t size;   // bytes for this column
+};
+
+struct Schema {
+    std::string          table_name;
+    std::vector<Column>  columns;
+    std::size_t          row_size;
+};
+
+class Table {
+public:
+    Table(Pager& pager, const Schema& schema, std::uint32_t root);
+
+    void        insert_row(const std::vector<std::string>& values);
+    std::vector<std::vector<std::string>>
+                scan(const std::string& where_col = "",
+                     const std::string& where_val = "");
+
+    const Schema& schema() const { return schema_; }
+
+private:
+    Pager&        pager_;
+    Schema        schema_;
+    BTree         btree_;
+    std::uint64_t next_rowid_{1};
+
+    std::vector<std::string> deserialize(const std::uint8_t* buf) const;
+    void                     serialize(const std::vector<std::string>& vals,
+                                       std::uint8_t* buf) const;
+};
+
+}
+```
+
+### src/table.cpp
+
+```cpp
+#include "table.hpp"
+#include <cstring>
+#include <stdexcept>
+
+namespace db {
+
+Table::Table(Pager& pager, const Schema& schema, std::uint32_t root)
+    : pager_{pager}, schema_{schema}, btree_{pager, root, schema.row_size} {}
+
+void Table::serialize(const std::vector<std::string>& vals, std::uint8_t* buf) const {
+    std::memset(buf, 0, schema_.row_size);
+    for (std::size_t i = 0; i < schema_.columns.size() && i < vals.size(); ++i) {
+        const auto& col = schema_.columns[i];
+        auto& v = vals[i];
+        std::size_t copy = std::min(v.size(), col.size - 1);
+        std::memcpy(buf + col.offset, v.data(), copy);
+    }
+}
+
+std::vector<std::string> Table::deserialize(const std::uint8_t* buf) const {
+    std::vector<std::string> out;
+    for (const auto& col : schema_.columns) {
+        out.emplace_back(reinterpret_cast<const char*>(buf + col.offset));
+    }
+    return out;
+}
+
+void Table::insert_row(const std::vector<std::string>& values) {
+    std::vector<std::uint8_t> buf(schema_.row_size, 0);
+    serialize(values, buf.data());
+    btree_.insert(next_rowid_++, buf.data(), schema_.row_size);
+    pager_.flush();
+}
+
+std::vector<std::vector<std::string>>
+Table::scan(const std::string& where_col, const std::string& where_val) {
+    std::vector<std::vector<std::string>> rows;
+    btree_.range(1, UINT64_MAX, [&](std::uint64_t, const std::uint8_t* val, std::size_t) {
+        auto row = deserialize(val);
+        if (!where_col.empty()) {
+            for (std::size_t i = 0; i < schema_.columns.size(); ++i) {
+                if (schema_.columns[i].name == where_col && row[i] != where_val) return;
+            }
+        }
+        rows.push_back(std::move(row));
+    });
+    return rows;
+}
+
+}
+```
+
+## Try it
+
+```cpp
+// main.cpp
+#include "pager.hpp"
+#include "table.hpp"
+#include <iostream>
+
+int main() {
+    db::Pager pager{"mytest.db", true};
+
+    // Define schema: id(8), name(32), age(8)
+    db::Schema s;
+    s.table_name = "users";
+    s.columns = {
+        {"id",   "INTEGER", 0,  8},
+        {"name", "TEXT",    8,  32},
+        {"age",  "INTEGER", 40, 8},
+    };
+    s.row_size = 48;
+
+    std::uint32_t root = pager.allocate();
+    db::init_leaf(pager.get(root));
+    pager.mark_dirty(root);
+
+    db::Table t{pager, s, root};
+    t.insert_row({"1", "Alice", "30"});
+    t.insert_row({"2", "Bob",   "25"});
+    t.insert_row({"3", "Carol", "35"});
+
+    for (const auto& row : t.scan()) {
+        for (const auto& col : row) std::cout << col << '\t';
+        std::cout << '\n';
+    }
+
+    for (const auto& row : t.scan("name", "Bob")) {
+        std::cout << "Found: " << row[1] << '\n';
+    }
+}
+```
+
+```bash
+cmake --build build
+./build/mydb
+# 1    Alice    30
+# 2    Bob      25
+# 3    Carol    35
+# Found: Bob
+```
+
+## Exercises
+
+1. Implement `delete(key)`. When a leaf becomes underfull (less than half
+   full), try to borrow from a sibling. If both siblings are at minimum,
+   merge and remove a key from the parent.
+2. Implement `update(key, new_value)` as a find + in-place write.
+3. Add support for variable-length values by using a separate overflow
+   page for values larger than a threshold (e.g. 512 bytes), storing a
+   `(page, offset)` pointer in the leaf cell instead.
+4. Print the tree structure: a recursive `dump()` that shows internal
+   keys and leaf entries with indentation.

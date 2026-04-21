@@ -1,0 +1,356 @@
+---
+title: Project scaffold — page format, pager, buffer cache
+description: Directory layout, CMake, on-disk page layout, and a pager with LRU buffer pool.
+---
+
+# Project scaffold
+
+By the end of this lesson `mydb` can open a file, allocate pages, read
+and write them through a buffer cache, and flush them to disk. No SQL yet —
+just the storage layer that everything else sits on.
+
+## Directory layout
+
+```
+mydb/
+├── CMakeLists.txt
+├── src/
+│   ├── main.cpp
+│   ├── page.hpp            # page constants and layout
+│   ├── pager.hpp/.cpp      # buffer pool
+│   ├── btree.hpp/.cpp      # B+ tree
+│   ├── table.hpp/.cpp      # row storage on top of btree
+│   ├── lexer.hpp/.cpp      # SQL lexer
+│   ├── parser.hpp/.cpp     # SQL parser
+│   ├── executor.hpp/.cpp   # query execution
+│   └── wal.hpp/.cpp        # write-ahead log
+└── tests/
+    └── run.sh
+```
+
+## CMakeLists.txt
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(mydb CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -g -O1)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+add_executable(mydb
+    src/main.cpp
+    src/pager.cpp
+    src/btree.cpp
+    src/table.cpp
+    src/lexer.cpp
+    src/parser.cpp
+    src/executor.cpp
+    src/wal.cpp
+)
+target_include_directories(mydb PRIVATE src)
+```
+
+## Page constants
+
+### src/page.hpp
+
+```cpp
+#pragma once
+#include <cstdint>
+#include <cstddef>
+
+namespace db {
+
+constexpr std::size_t PAGE_SIZE    = 4096;
+constexpr std::uint32_t NULL_PAGE  = 0xFFFFFFFF;
+
+// Page types stored in the first byte of every page.
+enum class PageType : std::uint8_t {
+    Free    = 0,
+    BTree   = 1,   // B+ tree node (internal or leaf)
+    Wal     = 2,   // WAL frame
+    Meta    = 3,   // database metadata (page 0)
+};
+
+// The very first page of the database file.
+struct MetaPage {
+    char         magic[8];       // "MYDB0001"
+    std::uint32_t root_page;     // B+ tree root
+    std::uint32_t page_count;    // total pages allocated
+    std::uint32_t free_list;     // head of free-page list (NULL_PAGE if empty)
+    std::uint8_t  padding[PAGE_SIZE - 8 - 12];
+};
+static_assert(sizeof(MetaPage) == PAGE_SIZE);
+
+}
+```
+
+## Pager
+
+The pager owns the file descriptor and a fixed-size buffer pool. Pages not
+in the pool are read from disk on demand.
+
+### src/pager.hpp
+
+```cpp
+#pragma once
+#include "page.hpp"
+
+#include <array>
+#include <cstdint>
+#include <list>
+#include <string>
+#include <unordered_map>
+
+namespace db {
+
+constexpr std::size_t CACHE_PAGES = 128;   // buffer pool size
+
+struct CachePage {
+    std::uint32_t page_no{NULL_PAGE};
+    bool          dirty{false};
+    std::array<std::uint8_t, PAGE_SIZE> data{};
+};
+
+class Pager {
+public:
+    explicit Pager(const std::string& path, bool create = false);
+    ~Pager();
+
+    // Returns a pointer into the buffer pool. Valid until next get() call
+    // that evicts this page. Don't hold across allocate().
+    std::uint8_t* get(std::uint32_t page_no);
+    void          mark_dirty(std::uint32_t page_no);
+
+    // Allocate a new page at the end of the file (or from free list).
+    std::uint32_t allocate();
+
+    // Write all dirty pages to disk.
+    void flush();
+
+    std::uint32_t page_count() const { return page_count_; }
+
+private:
+    int           fd_{-1};
+    std::uint32_t page_count_{0};
+
+    // LRU: front = most recently used
+    std::list<CachePage>                          lru_;
+    std::unordered_map<std::uint32_t,
+        std::list<CachePage>::iterator>           map_;
+
+    CachePage& pin(std::uint32_t page_no);
+    void       evict_one();
+    void       read_page(std::uint32_t page_no, std::uint8_t* buf);
+    void       write_page(std::uint32_t page_no, const std::uint8_t* buf);
+};
+
+}
+```
+
+### src/pager.cpp
+
+```cpp
+#include "pager.hpp"
+
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <stdexcept>
+#include <unistd.h>
+
+namespace db {
+
+Pager::Pager(const std::string& path, bool create) {
+    int flags = O_RDWR;
+    if (create) flags |= O_CREAT;
+    fd_ = ::open(path.c_str(), flags, 0644);
+    if (fd_ < 0) throw std::runtime_error("cannot open: " + path + ": " + std::strerror(errno));
+
+    // Determine existing page count.
+    off_t sz = ::lseek(fd_, 0, SEEK_END);
+    if (sz < 0) throw std::runtime_error("lseek failed");
+    page_count_ = static_cast<std::uint32_t>(sz / PAGE_SIZE);
+
+    if (page_count_ == 0) {
+        // New file: allocate meta page.
+        page_count_ = 1;
+        auto* p = get(0);
+        auto* meta = reinterpret_cast<MetaPage*>(p);
+        std::memset(meta, 0, PAGE_SIZE);
+        std::memcpy(meta->magic, "MYDB0001", 8);
+        meta->root_page  = NULL_PAGE;
+        meta->page_count = 1;
+        meta->free_list  = NULL_PAGE;
+        mark_dirty(0);
+        flush();
+    }
+}
+
+Pager::~Pager() {
+    flush();
+    if (fd_ >= 0) ::close(fd_);
+}
+
+void Pager::read_page(std::uint32_t page_no, std::uint8_t* buf) {
+    off_t off = static_cast<off_t>(page_no) * PAGE_SIZE;
+    if (::pread(fd_, buf, PAGE_SIZE, off) != PAGE_SIZE)
+        throw std::runtime_error("read_page failed: page " + std::to_string(page_no));
+}
+
+void Pager::write_page(std::uint32_t page_no, const std::uint8_t* buf) {
+    off_t off = static_cast<off_t>(page_no) * PAGE_SIZE;
+    if (::pwrite(fd_, buf, PAGE_SIZE, off) != PAGE_SIZE)
+        throw std::runtime_error("write_page failed: page " + std::to_string(page_no));
+}
+
+CachePage& Pager::pin(std::uint32_t page_no) {
+    auto it = map_.find(page_no);
+    if (it != map_.end()) {
+        // Move to front (most recently used).
+        lru_.splice(lru_.begin(), lru_, it->second);
+        return lru_.front();
+    }
+    if (lru_.size() >= CACHE_PAGES) evict_one();
+
+    lru_.push_front(CachePage{});
+    auto& cp = lru_.front();
+    cp.page_no = page_no;
+    cp.dirty   = false;
+
+    if (page_no < page_count_)
+        read_page(page_no, cp.data.data());
+    else
+        std::memset(cp.data.data(), 0, PAGE_SIZE);
+
+    map_[page_no] = lru_.begin();
+    return cp;
+}
+
+void Pager::evict_one() {
+    // Evict LRU (back of list).
+    for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+        if (it->dirty) write_page(it->page_no, it->data.data());
+        map_.erase(it->page_no);
+        lru_.erase(std::next(it).base());
+        return;
+    }
+}
+
+std::uint8_t* Pager::get(std::uint32_t page_no) {
+    return pin(page_no).data.data();
+}
+
+void Pager::mark_dirty(std::uint32_t page_no) {
+    auto it = map_.find(page_no);
+    if (it != map_.end()) it->second->dirty = true;
+}
+
+std::uint32_t Pager::allocate() {
+    // Check free list first.
+    auto* meta = reinterpret_cast<MetaPage*>(get(0));
+    if (meta->free_list != NULL_PAGE) {
+        std::uint32_t pg = meta->free_list;
+        auto* freed = get(pg);
+        meta->free_list = *reinterpret_cast<std::uint32_t*>(freed);
+        mark_dirty(0);
+        std::memset(get(pg), 0, PAGE_SIZE);
+        return pg;
+    }
+    std::uint32_t pg = page_count_++;
+    meta->page_count = page_count_;
+    mark_dirty(0);
+    // Extend file to cover new page.
+    std::array<std::uint8_t, PAGE_SIZE> zero{};
+    write_page(pg, zero.data());
+    return pg;
+}
+
+void Pager::flush() {
+    for (auto& cp : lru_) {
+        if (cp.dirty) {
+            write_page(cp.page_no, cp.data.data());
+            cp.dirty = false;
+        }
+    }
+    ::fsync(fd_);
+}
+
+}
+```
+
+## Smoke test
+
+```cpp
+// src/main.cpp (temporary)
+#include "pager.hpp"
+#include <cstring>
+#include <iostream>
+
+int main() {
+    db::Pager p{"test.db", true};
+    std::cout << "page_count=" << p.page_count() << '\n';  // 1 (meta)
+
+    std::uint32_t pg1 = p.allocate();
+    std::cout << "allocated page " << pg1 << '\n';         // 1
+
+    auto* buf = p.get(pg1);
+    std::memcpy(buf, "Hello, page!", 13);
+    p.mark_dirty(pg1);
+
+    p.flush();
+
+    // Re-read
+    auto* buf2 = p.get(pg1);
+    std::cout << reinterpret_cast<const char*>(buf2) << '\n';  // Hello, page!
+}
+```
+
+```bash
+cmake -S . -B build
+cmake --build build
+./build/mydb
+# page_count=1
+# allocated page 1
+# Hello, page!
+```
+
+Check on disk:
+
+```bash
+xxd test.db | head
+# 00000000: 4d59 4442 3030 3031 0000 0000 ...  MYDB0001....
+```
+
+The 8-byte magic is there. The pager is correct.
+
+## LRU eviction test
+
+```cpp
+// Force eviction by accessing CACHE_PAGES+1 unique pages.
+for (std::uint32_t i = 0; i < db::CACHE_PAGES + 10; ++i) {
+    db::Pager p2{"test2.db", true};  // fresh pager each time for brevity
+}
+```
+
+In practice you'd hold one pager and access many pages. ASan will catch
+use-after-eviction bugs immediately.
+
+## Exercises
+
+1. Implement page recycling: add a `free(page_no)` method that pushes the
+   page onto the free list. Verify `allocate()` reuses it.
+2. Add a `sync_mode` flag. When `false`, skip `fsync` for speed (tests).
+   When `true`, always fsync after flush (production).
+3. Replace the fixed `CACHE_PAGES` with a runtime configurable pool size.
+4. Add a simple page checksum (CRC32 of the first 4092 bytes stored in the
+   last 4 bytes). Verify it on read and fail loudly on mismatch.

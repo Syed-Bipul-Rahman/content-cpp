@@ -1,0 +1,124 @@
+---
+title: Prerequisites & mental model
+description: The three hard problems in databases — persistence, indexing, correctness — and how they compose.
+---
+
+# Prerequisites & mental model
+
+A database is one of the hardest programs to write correctly. Not because
+any single piece is complicated, but because three hard problems compose:
+**persistence** (bytes survive power loss), **indexing** (find them in
+O(log n)), and **correctness** (concurrent writers don't corrupt each
+other). We build them one layer at a time.
+
+## What you should already know
+
+- C++ Fundamentals through lesson 21, especially file I/O, pointers,
+  and memory layout.
+- Basic SQL at the user level: `CREATE TABLE`, `INSERT`, `SELECT`, `WHERE`.
+- Comfort with recursion (B-tree traversal is recursive).
+
+## The three hard problems
+
+### 1. Persistence: pages and the pager
+
+Disks work in blocks. A database pretends its file is an array of
+fixed-size **pages** (typically 4 KiB, matching the OS page size). Every
+data structure lives inside pages. Reading and writing happens one page at
+a time.
+
+A **pager** sits between the data structures and the OS. It:
+
+- Keeps a pool of in-memory pages (the buffer cache).
+- Maps `(page_number → in-memory buffer)`.
+- Knows which pages are dirty (modified but not yet written).
+- Flushes dirty pages on demand or on shutdown.
+
+The fundamental rule: **the database never directly reads or writes the
+file**. Everything goes through the pager.
+
+### 2. Indexing: B+ trees
+
+A sorted array supports binary search but doesn't support cheap insertion.
+A hash table supports O(1) lookup but not range scans. A B+ tree supports
+both: O(log n) point lookups, O(log n + k) range scans, and O(log n)
+inserts.
+
+A B+ tree is a tree where:
+
+- Every node is exactly one page.
+- Internal nodes hold keys and child pointers.
+- Leaf nodes hold the actual data (or row IDs pointing to a heap).
+- All leaves are linked in a doubly-linked list for range scans.
+- The tree stays balanced by splitting full nodes on insert.
+
+Why not a red-black tree? Because a red-black tree node is ~40 bytes.
+A 4 KiB page holds ~100 B+ tree keys. The tree is 2–3× shallower, which
+means 2–3× fewer disk reads per lookup.
+
+### 3. Correctness: WAL
+
+Imagine writing a multi-page transaction. After page 1 is written but
+before page 3 is written, the power goes out. The database is now
+inconsistent.
+
+A **write-ahead log** (WAL) fixes this. Before any page is modified on
+disk, the *intent* is written to the log. On crash, the database replays
+the log to redo committed transactions and undo uncommitted ones.
+
+The rule: **log before disk**. If the log write succeeds, the data write
+can always be re-done after a crash.
+
+## What we'll build
+
+| Lesson | Builds |
+| --- | --- |
+| 02 | Page format, pager with LRU cache, `create`/`read`/`flush` |
+| 03 | B+ tree: search, insert, split; row storage on leaf pages |
+| 04 | SQL lexer + parser, query execution engine (SELECT/INSERT/CREATE TABLE) |
+| 05 | WAL, crash recovery, transactions, tests, packaging |
+
+About 2000–3000 lines of C++. The result is a single-file database that
+accepts SQL, stores rows in a B+ tree, and survives crashes.
+
+## The storage hierarchy
+
+```
+SQL string
+    │
+    ▼
+Lexer + Parser  →  AST
+    │
+    ▼
+Query Executor  →  calls Table / Index API
+    │
+    ▼
+B+ Tree         →  calls Pager API
+    │
+    ▼
+Pager           →  calls OS file API
+    │
+    ▼
+WAL             →  sits between Pager and disk
+```
+
+Each layer only talks to the one below it. We build bottom-up.
+
+## The challenge: page layout on paper
+
+Before writing any code, draw a 4096-byte page for a B+ tree internal
+node with keys `[10, 20, 30]` and 4 child pointers. Answer:
+
+- How many bytes per key? Per pointer?
+- Where does the number of keys go?
+- How does the node know if it's a leaf or internal?
+- What's the maximum branching factor for a 4096-byte page with 8-byte
+  integer keys and 4-byte page pointers?
+
+Answering these on paper means the C++ struct definitions will be obvious,
+not cargo-culted.
+
+## Next
+
+Build the pager: the fixed-size page abstraction, the buffer pool, and
+the on-disk file format.

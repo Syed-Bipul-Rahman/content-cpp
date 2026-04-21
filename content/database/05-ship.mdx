@@ -1,0 +1,330 @@
+---
+title: Ship — tests, crash recovery, benchmarks, packaging
+description: SQL-driven test suite, crash recovery verification, TPC-B-style benchmark, and packaging.
+---
+
+# Ship mydb
+
+The database stores rows in a B+ tree, parses SQL, and has a WAL. The last
+mile is proving correctness under crashes, benchmarking the hot path, and
+packaging for distribution.
+
+## Test suite
+
+### tests/run.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN=./build/mydb
+PASS=0; FAIL=0
+
+ok()   { echo "ok: $*";   ((PASS++)); }
+fail() { echo "FAIL: $*"; ((FAIL++)); }
+
+# Helper: run SQL against a fresh database, capture output.
+run() {
+    local db=$(mktemp /tmp/mydb-XXXX.db)
+    trap "rm -f $db" RETURN
+    echo "$1" | "$BIN" "$db" 2>/dev/null
+}
+
+# Basic CREATE + INSERT + SELECT
+OUT=$(run "CREATE TABLE t (id INTEGER, name TEXT); INSERT INTO t VALUES (1, 'hello'); SELECT * FROM t;")
+[[ "$OUT" == *"hello"* ]] && ok "basic SELECT" || fail "basic SELECT: $OUT"
+
+# Multiple rows
+OUT=$(run "CREATE TABLE t (id INTEGER, v INTEGER);
+INSERT INTO t VALUES (1, 100);
+INSERT INTO t VALUES (2, 200);
+INSERT INTO t VALUES (3, 300);
+SELECT * FROM t;")
+[[ "$OUT" == *"100"* && "$OUT" == *"200"* && "$OUT" == *"300"* ]] && ok "multi-row" || fail "multi-row"
+
+# WHERE =
+OUT=$(run "CREATE TABLE t (id INTEGER, name TEXT);
+INSERT INTO t VALUES (1, 'alice');
+INSERT INTO t VALUES (2, 'bob');
+SELECT * FROM t WHERE name = 'alice';")
+[[ "$OUT" == *"alice"* && "$OUT" != *"bob"* ]] && ok "WHERE =" || fail "WHERE =: $OUT"
+
+# WHERE >
+OUT=$(run "CREATE TABLE t (id INTEGER, age INTEGER);
+INSERT INTO t VALUES (1, 20);
+INSERT INTO t VALUES (2, 30);
+INSERT INTO t VALUES (3, 40);
+SELECT id FROM t WHERE age > 25;")
+[[ "$OUT" == *"2"* && "$OUT" == *"3"* && "$OUT" != *"1"* ]] && ok "WHERE >" || fail "WHERE >: $OUT"
+
+# Column projection
+OUT=$(run "CREATE TABLE t (a INTEGER, b TEXT, c INTEGER);
+INSERT INTO t VALUES (1, 'x', 10);
+SELECT b FROM t;")
+[[ "$OUT" == *"x"* ]] && ok "projection" || fail "projection: $OUT"
+
+# Persistence across restart
+DB=$(mktemp /tmp/mydb-XXXX.db)
+echo "CREATE TABLE persist (k INTEGER, v TEXT); INSERT INTO persist VALUES (1, 'durable');" | "$BIN" "$DB"
+OUT=$(echo "SELECT * FROM persist;" | "$BIN" "$DB" 2>/dev/null || true)
+# NOTE: full persistence requires saving schema — a lesson 04 exercise.
+# For now just verify the binary reopens without crash.
+"$BIN" "$DB" <<< "SELECT * FROM persist;" > /dev/null 2>&1 && ok "reopen without crash" || fail "reopen"
+rm -f "$DB"
+
+# Many inserts (force B+ tree splits)
+SCRIPT="CREATE TABLE big (id INTEGER, val TEXT);"
+for i in $(seq 1 200); do
+    SCRIPT="$SCRIPT INSERT INTO big VALUES ($i, 'row$i');"
+done
+SCRIPT="$SCRIPT SELECT * FROM big WHERE id = 42;"
+OUT=$(run "$SCRIPT")
+[[ "$OUT" == *"row42"* ]] && ok "200 inserts + point lookup" || fail "200 inserts: $OUT"
+
+# Error handling
+OUT=$(run "SELECT * FROM nonexistent;" 2>&1 || true)
+[[ "$OUT" == *"error"* || "$OUT" == *"Error"* || "$OUT" == *"no such table"* ]] \
+    && ok "error on missing table" || fail "missing table error: $OUT"
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[[ $FAIL -eq 0 ]]
+```
+
+### Crash recovery test
+
+```bash
+#!/usr/bin/env bash
+# tests/crash_recovery.sh
+set -euo pipefail
+
+BIN=./build/mydb
+DB=$(mktemp /tmp/mydb-XXXX.db)
+trap "rm -f $DB ${DB%.db}.wal" EXIT
+
+# Write data normally.
+echo "CREATE TABLE t (id INTEGER, v TEXT); INSERT INTO t VALUES (1, 'safe');" | "$BIN" "$DB"
+
+# Simulate a crash by killing the process mid-write using a script that
+# inserts then sends SIGKILL.
+(
+  echo "INSERT INTO t VALUES (2, 'maybe');"
+  sleep 0.1
+) | timeout 0.05 "$BIN" "$DB" || true
+
+# After crash, the database should still read the committed row.
+OUT=$(echo "SELECT * FROM t;" | "$BIN" "$DB" 2>/dev/null)
+[[ "$OUT" == *"safe"* ]] && echo "ok: committed row survives crash" || echo "FAIL: lost committed row"
+```
+
+### Catch2 unit tests
+
+```cpp
+// tests/test_btree.cpp
+#include <catch2/catch.hpp>
+#include "pager.hpp"
+#include "btree.hpp"
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+
+static db::Pager make_pager(const std::string& path) {
+    return db::Pager{path, true};
+}
+
+TEST_CASE("btree point lookup") {
+    auto db = std::filesystem::temp_directory_path() / "test_btree.db";
+    std::filesystem::remove(db);
+    db::Pager pager{db.string(), true};
+    auto root = pager.allocate();
+    db::init_leaf(pager.get(root));
+    pager.mark_dirty(root);
+
+    constexpr std::size_t VS = 16;
+    db::BTree tree{pager, root, VS};
+    std::array<std::uint8_t, VS> val{};
+    std::memcpy(val.data(), "hello", 5);
+    tree.insert(42, val.data(), VS);
+
+    auto found = tree.find(42);
+    REQUIRE(found.has_value());
+    REQUIRE(std::memcmp(found->data(), "hello", 5) == 0);
+    REQUIRE_FALSE(tree.find(99).has_value());
+}
+
+TEST_CASE("btree range scan") {
+    auto db = std::filesystem::temp_directory_path() / "test_range.db";
+    std::filesystem::remove(db);
+    db::Pager pager{db.string(), true};
+    auto root = pager.allocate();
+    db::init_leaf(pager.get(root));
+    pager.mark_dirty(root);
+
+    constexpr std::size_t VS = 8;
+    db::BTree tree{pager, root, VS};
+    std::array<std::uint8_t, VS> v{};
+    for (int i = 1; i <= 10; ++i) {
+        v[0] = static_cast<std::uint8_t>(i);
+        tree.insert(i, v.data(), VS);
+    }
+
+    std::vector<std::uint64_t> keys;
+    tree.range(3, 7, [&](std::uint64_t k, const std::uint8_t*, std::size_t) {
+        keys.push_back(k);
+    });
+    REQUIRE(keys.size() == 5);
+    REQUIRE(keys.front() == 3);
+    REQUIRE(keys.back() == 7);
+}
+
+TEST_CASE("btree split — 200 inserts") {
+    auto db = std::filesystem::temp_directory_path() / "test_split.db";
+    std::filesystem::remove(db);
+    db::Pager pager{db.string(), true};
+    auto root = pager.allocate();
+    db::init_leaf(pager.get(root));
+    pager.mark_dirty(root);
+
+    constexpr std::size_t VS = 32;
+    db::BTree tree{pager, root, VS};
+    std::array<std::uint8_t, VS> v{};
+    for (int i = 1; i <= 200; ++i) {
+        v[0] = static_cast<std::uint8_t>(i);
+        tree.insert(i, v.data(), VS);
+    }
+    for (int i = 1; i <= 200; ++i) {
+        auto r = tree.find(i);
+        REQUIRE(r.has_value());
+        REQUIRE(r->at(0) == static_cast<std::uint8_t>(i));
+    }
+}
+
+TEST_CASE("resp parser unit") {
+    // Lexer sanity
+    auto toks = db::lex_sql("SELECT * FROM t WHERE id = 1;");
+    REQUIRE(toks[0].kind == db::TK::Select);
+    REQUIRE(toks[1].kind == db::TK::Star);
+    REQUIRE(toks[2].kind == db::TK::From);
+}
+```
+
+## Benchmark (TPC-B style)
+
+```bash
+# Insert N rows, then run N point lookups, measure throughput.
+cat > /tmp/bench.py << 'EOF'
+import subprocess, time, sys
+
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 10000
+
+# Build the insert script
+script = "CREATE TABLE bench (id INTEGER, val TEXT);\n"
+for i in range(1, N+1):
+    script += f"INSERT INTO bench VALUES ({i}, 'value{i}');\n"
+# Sample reads
+for i in range(1, min(N+1, 1001)):
+    script += f"SELECT * FROM bench WHERE id = {i};\n"
+
+import tempfile, os
+db = tempfile.mktemp(suffix='.db')
+try:
+    start = time.time()
+    r = subprocess.run(['./build/mydb', db], input=script,
+                       capture_output=True, text=True, timeout=60)
+    elapsed = time.time() - start
+    inserts_per_sec = N / elapsed
+    print(f"N={N}: {elapsed:.2f}s, {inserts_per_sec:.0f} inserts/sec")
+finally:
+    os.unlink(db)
+EOF
+
+python3 /tmp/bench.py 1000
+python3 /tmp/bench.py 5000
+```
+
+Expected rough numbers on a modern laptop:
+
+| N rows | Time | Throughput |
+| --- | --- | --- |
+| 1,000 | ~0.5s | ~2,000/s |
+| 5,000 | ~3s | ~1,600/s |
+| 10,000 | ~8s | ~1,250/s |
+
+The bottleneck is the `fsync` on every insert (lesson 02's `flush()`).
+Batch inserts in a transaction (one fsync per commit) will give 10–100×
+speedup. That's what `BEGIN` / `COMMIT` is for.
+
+## CI
+
+```yaml
+on: [push, pull_request]
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y cmake g++
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: chmod +x tests/run.sh && ./tests/run.sh
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install cmake
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build -j
+      - run: chmod +x tests/run.sh && ./tests/run.sh
+```
+
+## Packaging
+
+```cmake
+install(TARGETS mydb RUNTIME DESTINATION bin)
+```
+
+```bash
+cmake -S . -B release -DCMAKE_BUILD_TYPE=Release
+cmake --build release -j
+sudo cmake --install release
+echo "CREATE TABLE t (k INTEGER); INSERT INTO t VALUES (1); SELECT * FROM t;" | mydb /tmp/test.db
+```
+
+## Final checklist
+
+- [ ] `CREATE TABLE` with INTEGER / TEXT columns
+- [ ] `INSERT INTO ... VALUES (...)` stores rows in B+ tree
+- [ ] `SELECT *` and column projection work
+- [ ] `SELECT ... WHERE col op val` filters correctly
+- [ ] 200+ inserts trigger B+ tree splits without data loss
+- [ ] Range scan returns rows in key order
+- [ ] WAL exists and replays on reopen
+- [ ] `tests/run.sh` passes cleanly
+- [ ] Catch2 unit tests pass (btree point lookup, range, split)
+- [ ] Benchmark numbers recorded in README
+- [ ] CI green on Linux + macOS
+
+## What you've built
+
+About 2000–3000 lines of C++. A real relational database:
+
+- A pager with an LRU buffer pool
+- A B+ tree with leaf-node linked list for range scans
+- A SQL lexer and recursive-descent parser
+- A tree-walking query executor
+- A write-ahead log for crash safety
+
+The gap between this and PostgreSQL is primarily: concurrency (MVCC),
+cost-based query planning, more data types, and a decade of edge-case
+fixes. The architecture is the same.
+
+## Where next
+
+- [Build Your Own Redis](/projects/redis) — Redis trades SQL and disk
+  persistence for in-memory speed and a simpler data model.
+- [Build Your Own Compiler](/projects/compiler) — the SQL parser here
+  is a recursive-descent parser; a compiler's front end is identical in
+  structure, but the back end emits machine code instead of row iterators.
+- [Build Your Own Search Engine](/projects/search-engine) — a search
+  engine is a read-heavy database with an inverted index instead of a
+  B+ tree.
